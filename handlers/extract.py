@@ -34,6 +34,11 @@ import config
 from db import database as db
 from services.downloader import download_file, download_from_url
 from services.extractor import (
+    ALL_CREDENTIAL_MODES,
+    COMBO_FULL_MODE,
+    COMBO_TARGETED_MODE,
+    COOKIE_MODE,
+    ULP_MODE,
     ExtractionProgress,
     guess_archive_password_async,
     probe_encrypted_entries_async,
@@ -45,7 +50,16 @@ from utils.formatting import bytes_human, progress_bar, seconds_human, time_unti
 from utils.validators import validate_archive, validate_domains
 
 # Conversation states
-DOMAIN, FILE = range(2)
+DOMAIN, MODE, FILE = range(3)
+
+# Available output modes, in keyboard order. Each entry is
+# ``(mode_id, short label, emoji)``.
+_MODE_BUTTONS = [
+    (COOKIE_MODE, "Cookies", "\U0001f36a"),
+    (ULP_MODE, "ULP url:user:pass", "\U0001f4dd"),
+    (COMBO_TARGETED_MODE, "Combo (targeted)", "\U0001f3af"),
+    (COMBO_FULL_MODE, "Combo (full)", "\U0001f4e6"),
+]
 
 # Module-level job queue (initialised in register())
 _job_queue: JobQueue | None = None
@@ -90,6 +104,10 @@ class RescanEntry:
     password: Optional[str]
     expires_at: float                       # monotonic clock
     cleanup_task: "asyncio.Task[None]" = field(repr=False)
+    # Output modes the user picked on the original extraction. Reused
+    # for rescans so the second pass produces the same kind of output
+    # files as the first. None means "cookies only" (legacy default).
+    output_modes: Optional["frozenset[str]"] = None
 
 
 # user_id -> RescanEntry. At most one open rescan window per user.
@@ -132,6 +150,7 @@ def _register_rescan(
     file_size: int,
     window_seconds: float,
     password: Optional[str] = None,
+    output_modes: Optional["frozenset[str]"] = None,
 ) -> RescanEntry:
     """Register *archive_path* as a fresh rescan entry for *user_id*.
 
@@ -160,6 +179,7 @@ def _register_rescan(
         password=password,
         expires_at=expires_at,
         cleanup_task=task,
+        output_modes=output_modes,
     )
     _rescan_store[user_id] = entry
     return entry
@@ -303,6 +323,110 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _kickoff_rescan_job(update, context, entry, domains)
         return ConversationHandler.END
 
+    # Initialise the mode-selection state with sane defaults: cookies
+    # only (the legacy behavior) so the user can just hit "Done" if they
+    # only care about cookie extraction.
+    context.user_data["extract_modes"] = {COOKIE_MODE}  # type: ignore[index]
+
+    await update.message.reply_text(
+        _mode_picker_text(domains),
+        reply_markup=_mode_picker_kb(context.user_data["extract_modes"], domains),  # type: ignore[union-attr]
+        parse_mode="HTML",
+    )
+    return MODE
+
+
+# ── State: MODE ────────────────────────────────────────────
+def _mode_picker_text(domains: List[str]) -> str:
+    domain_label = (
+        domains[0] if len(domains) == 1
+        else f"{len(domains)} domains"
+    )
+    return (
+        f"\u2699\ufe0f <b>Output format</b>\n"
+        f"\U0001f310 Target: <code>{domain_label}</code>\n\n"
+        f"Pick one or more formats. Toggle each on/off, then tap "
+        f"<b>Done</b>. You can mix cookies with credential exports — "
+        f"the archive is only scanned once.\n\n"
+        f"\u2022 <b>Cookies</b> \u2014 Netscape <code>.txt</code> per "
+        f"target domain (legacy)\n"
+        f"\u2022 <b>ULP</b> \u2014 every <code>url:user:pass</code> in "
+        f"the logs, deduped\n"
+        f"\u2022 <b>Combo (targeted)</b> \u2014 <code>user:pass</code> "
+        f"for the target domain(s) only\n"
+        f"\u2022 <b>Combo (full)</b> \u2014 <code>user:pass</code> "
+        f"grouped by host, every domain in the logs"
+    )
+
+
+def _mode_picker_kb(
+    selected: "set[str]",
+    domains: List[str],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for mode_id, label, emoji in _MODE_BUTTONS:
+        mark = "\u2705" if mode_id in selected else "\u2b1c"
+        rows.append([
+            InlineKeyboardButton(
+                f"{mark} {emoji} {label}",
+                callback_data=f"mode_toggle:{mode_id}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            "\u2705 Done \u2192 send archive", callback_data="mode_done",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def mode_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Flip one output-mode checkbox on or off."""
+    q = update.callback_query
+    if q is None or q.data is None:
+        return MODE
+    await q.answer()
+    mode_id = q.data.split(":", 1)[1] if ":" in q.data else ""
+    if mode_id not in {m for m, _, _ in _MODE_BUTTONS}:
+        return MODE
+    selected: set = context.user_data.get("extract_modes") or {COOKIE_MODE}  # type: ignore[union-attr,assignment]
+    if mode_id in selected:
+        selected.discard(mode_id)
+    else:
+        selected.add(mode_id)
+    context.user_data["extract_modes"] = selected  # type: ignore[index]
+    domains: list[str] = context.user_data.get("extract_domains", [])  # type: ignore[union-attr]
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=_mode_picker_kb(selected, domains),
+        )
+    except Exception:
+        pass
+    return MODE
+
+
+async def mode_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User finished picking output modes — move on to the FILE state."""
+    q = update.callback_query
+    user = update.effective_user
+    if q is None or user is None:
+        return MODE
+    await q.answer()
+
+    selected: set = context.user_data.get("extract_modes") or set()  # type: ignore[union-attr,assignment]
+    if not selected:
+        try:
+            await q.answer(
+                "Pick at least one format first.", show_alert=True,
+            )
+        except Exception:
+            pass
+        return MODE
+
+    domains: list[str] = context.user_data.get("extract_domains", [])  # type: ignore[union-attr]
     is_admin = user.id == config.ADMIN_ID
     remaining = await db.get_remaining_quota(user.id)
     vip = await db.is_vip(user.id)
@@ -325,15 +449,33 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             + ", ".join(domains)
         )
 
+    mode_label = ", ".join(
+        f"{emoji} {label}"
+        for mid, label, emoji in _MODE_BUTTONS
+        if mid in selected
+    )
+
     text = (
         f"{domain_line}\n"
-        f"\U0001f4c1 Now send your archive file — OR paste a direct "
-        f"download URL (.zip / .rar).\n"
-        f"Supported: .zip .rar .7z .tar.gz\n"
+        f"\u2699\ufe0f Output: {mode_label}\n"
+        f"\U0001f4c1 Now send your archive file \u2014 OR paste a direct "
+        f"download URL (mega.nz, mediafire, gofile, upload.ee, "
+        f"pixeldrain, krakenfiles, bunkr, dropmefiles, qiwi.gg, "
+        f"send.cm, swisstransfer, zippyshare).\n"
+        f"Supported archives: .zip .rar .7z .tar.gz\n"
         f"Your limit: {limit_text} remaining today\n"
         f"Max file size: {max_file}"
     )
-    await update.message.reply_text(text, reply_markup=_cancel_kb())
+    try:
+        await q.edit_message_text(text, reply_markup=_cancel_kb())
+    except Exception:
+        # Fallback to a new message if the inline edit failed (rare).
+        if update.effective_chat is not None:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                reply_markup=_cancel_kb(),
+            )
     return FILE
 
 
@@ -408,11 +550,19 @@ async def _kickoff_rescan_job(
     progress = ExtractionProgress()
     _active_progress[job_id] = progress
 
+    # Rescan reuses whatever output modes the user picked on the
+    # ORIGINAL extraction. Falls back to cookies-only for older rescan
+    # entries that pre-date this field.
+    modes = frozenset(
+        getattr(entry, "output_modes", None) or {COOKIE_MODE},
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             ("rescan", entry.archive_path, entry.file_name),
             progress_msg, progress,
+            output_modes=modes,
         )
 
     item = QueueItem(
@@ -516,10 +666,15 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     source_ref = update.message  # Telegram document source
 
+    modes = frozenset(
+        context.user_data.get("extract_modes") or {COOKIE_MODE},  # type: ignore[union-attr]
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             source_ref, progress_msg, progress,
+            output_modes=modes,
         )
 
     # Enqueue with three-tier priority (admin > VIP > free).
@@ -594,10 +749,15 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     progress = ExtractionProgress()
     _active_progress[job_id] = progress
 
+    modes = frozenset(
+        context.user_data.get("extract_modes") or {COOKIE_MODE},  # type: ignore[union-attr]
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             ("url", raw, file_name), progress_msg, progress,
+            output_modes=modes,
         )
 
     item = QueueItem(
@@ -628,6 +788,7 @@ async def _process_job(
     original_msg,
     progress_msg,
     progress: ExtractionProgress,
+    output_modes: frozenset = frozenset({COOKIE_MODE}),
 ) -> None:
     """Download, extract, send results — runs inside the queue worker."""
     start_ts = time.monotonic()
@@ -713,10 +874,11 @@ async def _process_job(
             )
             return
 
-        # Extract — run_extraction_async accepts a single domain string
-        # or a list of domains for multi-target jobs.
+        # Extract — pass the user-selected output modes so the same
+        # archive can produce cookies + ULP + combo files in one pass.
         result = await run_extraction_async(
             archive_path, domains, progress, password=password,
+            output_modes=output_modes,
         )
 
         if not updater_task.done():
@@ -816,6 +978,7 @@ async def _process_job(
                                 cached_size,
                                 float(config.RESCAN_WINDOW_SECONDS),
                                 password=cached_pw,
+                                output_modes=output_modes,
                             )
                             rescan_armed = True
                 elif os.path.exists(archive_path):
@@ -834,6 +997,7 @@ async def _process_job(
                             os.path.getsize(target_path),
                             float(config.RESCAN_WINDOW_SECONDS),
                             password=password,
+                            output_modes=output_modes,
                         )
                         rescan_armed = True
                     else:
@@ -865,7 +1029,28 @@ async def _process_job(
         summary = (
             f"{header}\n\n"
             f"{domain_lines}"
-            f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
+        )
+        if COOKIE_MODE in output_modes:
+            summary += (
+                f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
+            )
+        # Per-credential-mode totals (only show what was requested).
+        cred_counts = getattr(result, "credential_counts", {}) or {}
+        if ULP_MODE in output_modes:
+            summary += (
+                f"\U0001f4dd ULP lines: {cred_counts.get(ULP_MODE, 0):,}\n"
+            )
+        if COMBO_TARGETED_MODE in output_modes:
+            summary += (
+                f"\U0001f3af Combo (targeted): "
+                f"{cred_counts.get(COMBO_TARGETED_MODE, 0):,}\n"
+            )
+        if COMBO_FULL_MODE in output_modes:
+            summary += (
+                f"\U0001f4e6 Combo (full): "
+                f"{cred_counts.get(COMBO_FULL_MODE, 0):,}\n"
+            )
+        summary += (
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"
             f"\u23f1 Time taken: {seconds_human(duration)}\n"
@@ -1568,6 +1753,11 @@ def register(app, job_queue: JobQueue) -> None:
         states={
             DOMAIN: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, domain_received),
+                CallbackQueryHandler(cancel_extract, pattern="^extract_cancel$"),
+            ],
+            MODE: [
+                CallbackQueryHandler(mode_toggle, pattern=r"^mode_toggle:"),
+                CallbackQueryHandler(mode_done, pattern=r"^mode_done$"),
                 CallbackQueryHandler(cancel_extract, pattern="^extract_cancel$"),
             ],
             FILE: [

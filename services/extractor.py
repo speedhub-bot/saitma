@@ -21,15 +21,28 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Union
+from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Union
 
 from loguru import logger
 
 import config
+from services import log_parser
 
 MAX_TEXT_SCAN_BYTES = 64 * 1024 * 1024
 PROCESS_TAIL_BYTES = 8192
 ARCHIVE_PROCESS_IDLE_SECONDS = 900.0
+
+# Output mode tokens for ``run_extraction_async``. Kept up top so the
+# zip-streaming fast path (defined before _run_extraction) can use the
+# defaults too.
+COOKIE_MODE = "cookies"
+ULP_MODE = "ulp"
+COMBO_TARGETED_MODE = "combo_targeted"
+COMBO_FULL_MODE = "combo_full"
+ALL_CREDENTIAL_MODES: "FrozenSet[str]" = frozenset(
+    {ULP_MODE, COMBO_TARGETED_MODE, COMBO_FULL_MODE}
+)
+DEFAULT_OUTPUT_MODES: "FrozenSet[str]" = frozenset({COOKIE_MODE})
 
 
 # ════════════════════════════════════════════════════════════
@@ -265,6 +278,7 @@ class ExtractionProgress:
     files_total: int = 0
     files_scanned: int = 0
     cookies_found: int = 0
+    credentials_found: int = 0   # ULP / combo password rows produced
     download_current: int = 0
     download_total: int = 0
     download_start: float = 0.0     # monotonic timestamp when download began
@@ -300,6 +314,12 @@ class ExtractionResult:
     # was configured for one or more domains; keys are the cleaned target
     # domain strings.
     per_domain_counts: Dict[str, int] = field(default_factory=dict)
+    # Credential-mode counters (ULP / combo). Zero when those modes
+    # weren't requested.
+    credentials_found: int = 0
+    # Per-output-mode counts so the user-facing summary can show
+    # ``2,431 ULP / 187 claude.ai combos``.
+    credential_counts: Dict[str, int] = field(default_factory=dict)
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
@@ -1404,20 +1424,30 @@ def _run_extraction_zip_stream(
     progress: ExtractionProgress,
     output_dir: str,
     start: float,
+    output_modes: FrozenSet[str] = DEFAULT_OUTPUT_MODES,
 ) -> ExtractionResult:
     """Fast path for plain zip archives: walk members in place, scan
     each one in memory, write per-source .txt files (one folder per
     target domain) + bundle into one zip per domain.
 
+    When *output_modes* includes any credential mode (ULP / combo) we
+    also stream-parse every password file in the same loop and emit
+    the matching output files alongside the cookie zips.
+
     Saves the disk-space + wall-clock cost of first unpacking the whole
     archive to a temp dir, matching u.txt's ``extractZipStreaming`` idea.
     """
-    logger.info("Zip-streaming {} (no disk extraction)", archive_path)
+    logger.info(
+        "Zip-streaming {} (no disk extraction), modes={}",
+        archive_path, sorted(output_modes),
+    )
     progress.phase = "extracting"
     progress.extract_start = time.monotonic()
     progress.current_file = ""
 
     domains = _coerce_domains(domain)
+    want_cookies = COOKIE_MODE in output_modes
+    want_creds = bool(output_modes & ALL_CREDENTIAL_MODES)
 
     per_source_dir = tempfile.mkdtemp(
         dir=str(config.TEMP_DIR), prefix="cookie_out_",
@@ -1434,6 +1464,8 @@ def _run_extraction_zip_stream(
 
     cookie_parser = SmartCookieExtractor(domains)
     per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+    creds: List[log_parser.Credential] = []
+    creds_seen: Set = set()
 
     try:
         try:
@@ -1463,20 +1495,35 @@ def _run_extraction_zip_stream(
                     progress.files_scanned += 1
                     continue
 
+                is_pwd = want_creds and log_parser.is_password_file(member.filename)
+
+                # Read once, parse for both cookies and credentials as
+                # requested. Tabbed cookie files have no ``@`` lines so
+                # the ULP parser will skip them naturally.
                 try:
                     with zf.open(member, "r") as fh:
-                        cookies = cookie_parser.extract_from_lines(
-                            line.decode("utf-8", errors="ignore")
-                            for line in fh
-                        )
+                        raw_bytes = fh.read()
                 except (RuntimeError, zipfile.BadZipFile, OSError):
-                    # RuntimeError from zipfile means encrypted entry —
-                    # we already probed and ruled that out, but just in
-                    # case skip silently instead of aborting the job.
                     progress.files_scanned += 1
                     continue
-                except Exception:
-                    cookies = []
+                text = raw_bytes.decode("utf-8", errors="ignore")
+
+                cookies: List[Dict[str, str]] = []
+                if want_cookies:
+                    try:
+                        cookies = cookie_parser.extract_from_lines(
+                            iter(text.splitlines())
+                        )
+                    except Exception:
+                        cookies = []
+
+                if is_pwd:
+                    for c in log_parser.parse_any(text):
+                        key = (c.url, c.user, c.password)
+                        if key in creds_seen:
+                            continue
+                        creds_seen.add(key)
+                        creds.append(c)
 
                 if cookies:
                     # Group hits from this source file by target domain so
@@ -1516,7 +1563,23 @@ def _run_extraction_zip_stream(
 
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+        output_files: List[str] = []
+        if want_cookies:
+            output_files.extend(
+                _bundle_all_zips(per_source_dir, output_dir, domains)
+            )
+
+        # Emit credential output files (ULP / combo) into output_dir
+        # alongside the cookie zips. These ride on the same job's
+        # delivery path so the user gets everything in one drop.
+        cred_counts: Dict[str, int] = {}
+        if want_creds:
+            output_files.extend(
+                _emit_credential_outputs(
+                    creds, domains, output_modes, output_dir, progress,
+                )
+            )
+            cred_counts = _credential_counts(creds, domains, output_modes)
 
         output_files = [
             p for p in output_files
@@ -1533,8 +1596,10 @@ def _run_extraction_zip_stream(
                 files_scanned=progress.files_scanned,
                 duration_seconds=duration,
                 partial=True,
-                error="" if output_files else "Cancelled by user (no cookies found yet)",
+                error="" if output_files else "Cancelled by user (no results yet)",
                 per_domain_counts=per_domain_counts,
+                credentials_found=progress.credentials_found,
+                credential_counts=cred_counts,
             )
 
         progress.phase = "done"
@@ -1545,10 +1610,186 @@ def _run_extraction_zip_stream(
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
             per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
         )
 
     finally:
         shutil.rmtree(per_source_dir, ignore_errors=True)
+
+
+# ── Credential output (ULP / combo) ─────────────────────────
+
+
+def _safe_domain_label(domains: Iterable[str]) -> str:
+    """Filesystem-safe slug for the first domain (or ``multi`` for many)."""
+    domain_list = [d for d in domains if d]
+    if not domain_list:
+        return "logs"
+    if len(domain_list) == 1:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", domain_list[0])
+    return "multi"
+
+
+def _collect_credentials_from_zip(
+    zf: "zipfile.ZipFile",
+    progress: ExtractionProgress,
+) -> List[log_parser.Credential]:
+    """Stream-scan a zip's password files in memory, no disk extraction.
+
+    Used by the streaming fast-path so credential modes don't force
+    a full disk extraction.
+    """
+    creds: List[log_parser.Credential] = []
+    seen: Set = set()
+    for member in zf.infolist():
+        if progress.cancelled:
+            break
+        if member.is_dir():
+            continue
+        if not log_parser.is_password_file(member.filename):
+            continue
+        if member.file_size and member.file_size > MAX_TEXT_SCAN_BYTES:
+            continue
+        try:
+            with zf.open(member, "r") as fh:
+                raw = fh.read()
+        except (RuntimeError, zipfile.BadZipFile, OSError):
+            continue
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        for c in log_parser.parse_any(text):
+            key = (c.url, c.user, c.password)
+            if key in seen:
+                continue
+            seen.add(key)
+            creds.append(c)
+    return creds
+
+
+def _collect_credentials_from_dir(
+    root: str,
+    progress: ExtractionProgress,
+) -> List[log_parser.Credential]:
+    """Walk *root* and collect deduped credentials from every password file."""
+    creds: List[log_parser.Credential] = []
+    seen: Set = set()
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            if progress.cancelled:
+                return creds
+            fpath = os.path.join(dirpath, fname)
+            if not log_parser.is_password_file(fpath):
+                continue
+            try:
+                if os.path.getsize(fpath) > MAX_TEXT_SCAN_BYTES:
+                    continue
+                with open(fpath, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            for c in log_parser.parse_any(text):
+                key = (c.url, c.user, c.password)
+                if key in seen:
+                    continue
+                seen.add(key)
+                creds.append(c)
+    return creds
+
+
+def _emit_credential_outputs(
+    creds: List[log_parser.Credential],
+    domains: List[str],
+    output_modes: FrozenSet[str],
+    output_dir: str,
+    progress: ExtractionProgress,
+) -> List[str]:
+    """Write requested credential output files into *output_dir*.
+
+    Returns the list of files created (skipping empty ones). Bumps
+    ``progress.credentials_found`` to the total rows produced across
+    all enabled modes (deduped within each mode but not across modes —
+    a single ``user:pass`` may show up in both ULP and combo files).
+    """
+    out_files: List[str] = []
+    if not creds:
+        return out_files
+
+    slug = _safe_domain_label(domains)
+
+    if ULP_MODE in output_modes:
+        body = log_parser.format_ulp(creds)
+        if body.strip():
+            path = os.path.join(output_dir, f"{slug}_ulp.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                lines = body.count("\n")
+                progress.credentials_found += lines
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write ULP output {}", path)
+
+    if COMBO_TARGETED_MODE in output_modes and domains:
+        body = log_parser.format_combo_targeted(creds, domains)
+        if body.strip():
+            target_slug = re.sub(
+                r"[^A-Za-z0-9._-]", "_",
+                domains[0] if len(domains) == 1 else "targets",
+            )
+            path = os.path.join(
+                output_dir, f"{slug}_combo_targeted_{target_slug}.txt",
+            )
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                lines = body.count("\n")
+                progress.credentials_found += lines
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write combo-targeted output {}", path)
+
+    if COMBO_FULL_MODE in output_modes:
+        body = log_parser.format_combo_full(creds)
+        if body.strip():
+            path = os.path.join(output_dir, f"{slug}_combo_full.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                # Section headers + blank lines aren't credentials; count
+                # only ``user:pass`` rows by re-running the formatter
+                # against the deduped cred set.
+                progress.credentials_found += len(set(c.combo_line for c in creds))
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write combo-full output {}", path)
+
+    return out_files
+
+
+def _credential_counts(
+    creds: List[log_parser.Credential],
+    domains: List[str],
+    output_modes: FrozenSet[str],
+) -> Dict[str, int]:
+    """Per-mode line-count summary used for the user-facing result text."""
+    counts: Dict[str, int] = {}
+    if not creds:
+        return counts
+    if ULP_MODE in output_modes:
+        counts[ULP_MODE] = len({c.ulp_line for c in creds})
+    if COMBO_TARGETED_MODE in output_modes and domains:
+        body = log_parser.format_combo_targeted(creds, domains)
+        counts[COMBO_TARGETED_MODE] = body.count("\n") if body.strip() else 0
+    if COMBO_FULL_MODE in output_modes:
+        counts[COMBO_FULL_MODE] = len({c.combo_line for c in creds})
+    return counts
 
 
 def _run_extraction(
@@ -1556,6 +1797,7 @@ def _run_extraction(
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
+    output_modes: FrozenSet[str] = DEFAULT_OUTPUT_MODES,
 ) -> ExtractionResult:
     """Blocking extraction — meant to run inside ``asyncio.to_thread``.
 
@@ -1581,6 +1823,7 @@ def _run_extraction(
         ):
             return _run_extraction_zip_stream(
                 archive_path, domains, progress, output_dir, start,
+                output_modes=output_modes,
             )
 
         # Phase 1: extract archive
@@ -1607,7 +1850,8 @@ def _run_extraction(
         # matching cookies, named ``akaza_{domain}_{counter}.txt`` and
         # then bundled into one zip per target domain.
         progress.phase = "scanning"
-        extractor = SmartCookieExtractor(domains)
+        want_cookies = COOKIE_MODE in output_modes
+        extractor = SmartCookieExtractor(domains) if want_cookies else None
 
         all_files: List[str] = []
         for root, _dirs, files in os.walk(temp_dir):
@@ -1635,6 +1879,11 @@ def _run_extraction(
                     progress.files_scanned += 1
                     continue
             except OSError:
+                progress.files_scanned += 1
+                continue
+            if not want_cookies:
+                # Skip cookie scanning entirely. Credentials are
+                # collected in the dedicated dir-walk below.
                 progress.files_scanned += 1
                 continue
             try:
@@ -1679,12 +1928,28 @@ def _run_extraction(
         # Phase 3: bundle per-source .txt files into one zip per domain.
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+        output_files: List[str] = []
+        if COOKIE_MODE in output_modes:
+            output_files.extend(
+                _bundle_all_zips(per_source_dir, output_dir, domains)
+            )
 
         # The per-source temp dir is no longer needed once zipped.
         shutil.rmtree(per_source_dir, ignore_errors=True)
 
-        # Drop empty zip files (shouldn't happen, but belt-and-braces).
+        # Optional phase 4: scan the same extracted tree for password
+        # files and emit ULP / combo outputs.
+        cred_counts: Dict[str, int] = {}
+        if output_modes & ALL_CREDENTIAL_MODES:
+            creds = _collect_credentials_from_dir(temp_dir, progress)
+            output_files.extend(
+                _emit_credential_outputs(
+                    creds, domains, output_modes, output_dir, progress,
+                )
+            )
+            cred_counts = _credential_counts(creds, domains, output_modes)
+
+        # Drop empty output files (shouldn't happen, but belt-and-braces).
         output_files = [
             p for p in output_files
             if os.path.exists(p) and os.path.getsize(p) > 0
@@ -1701,8 +1966,10 @@ def _run_extraction(
                 files_scanned=progress.files_scanned,
                 duration_seconds=duration,
                 partial=True,
-                error="" if output_files else "Cancelled by user (no cookies found yet)",
+                error="" if output_files else "Cancelled by user (no results yet)",
                 per_domain_counts=per_domain_counts,
+                credentials_found=progress.credentials_found,
+                credential_counts=cred_counts,
             )
 
         progress.phase = "done"
@@ -1713,6 +1980,8 @@ def _run_extraction(
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
             per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
         )
 
     except Exception as exc:
@@ -1733,15 +2002,23 @@ async def run_extraction_async(
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
+    output_modes: Optional[Iterable[str]] = None,
 ) -> ExtractionResult:
     """Non-blocking facade — offloads heavy work to a thread.
 
     *domain* may be either a single domain string or an iterable of
     domain strings; in the multi-domain case each target gets its own
     output zip.
+
+    *output_modes* selects which outputs to produce. Defaults to
+    ``{COOKIE_MODE}`` (legacy behavior). Pass a set that includes any
+    of ``ULP_MODE``, ``COMBO_TARGETED_MODE``, ``COMBO_FULL_MODE`` to
+    also emit credential files. Cookies and credentials can be mixed
+    in one job; the same archive is scanned once for both.
     """
+    modes = frozenset(output_modes) if output_modes else DEFAULT_OUTPUT_MODES
     return await asyncio.to_thread(
-        _run_extraction, archive_path, domain, progress, password
+        _run_extraction, archive_path, domain, progress, password, modes,
     )
 
 
