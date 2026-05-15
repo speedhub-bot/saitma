@@ -39,8 +39,12 @@ COOKIE_MODE = "cookies"
 ULP_MODE = "ulp"
 COMBO_TARGETED_MODE = "combo_targeted"
 COMBO_FULL_MODE = "combo_full"
+CC_MODE = "cc"
 ALL_CREDENTIAL_MODES: "FrozenSet[str]" = frozenset(
     {ULP_MODE, COMBO_TARGETED_MODE, COMBO_FULL_MODE}
+)
+ALL_NON_COOKIE_MODES: "FrozenSet[str]" = frozenset(
+    {ULP_MODE, COMBO_TARGETED_MODE, COMBO_FULL_MODE, CC_MODE}
 )
 DEFAULT_OUTPUT_MODES: "FrozenSet[str]" = frozenset({COOKIE_MODE})
 
@@ -1448,6 +1452,7 @@ def _run_extraction_zip_stream(
     domains = _coerce_domains(domain)
     want_cookies = COOKIE_MODE in output_modes
     want_creds = bool(output_modes & ALL_CREDENTIAL_MODES)
+    want_cc = CC_MODE in output_modes
 
     per_source_dir = tempfile.mkdtemp(
         dir=str(config.TEMP_DIR), prefix="cookie_out_",
@@ -1466,6 +1471,7 @@ def _run_extraction_zip_stream(
     per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
     creds: List[log_parser.Credential] = []
     creds_seen: Set = set()
+    cc_by_num: Dict[str, "log_parser.CreditCard"] = {}
 
     try:
         try:
@@ -1496,8 +1502,20 @@ def _run_extraction_zip_stream(
                     continue
 
                 is_pwd = want_creds and log_parser.is_password_file(member.filename)
+                # CC scanning runs on both dedicated CC files and on
+                # password dumps — many stealers inline CC data right
+                # next to the passwords block. ``cc_strict`` is True
+                # for password files (require MM/YY/CVV near each hit)
+                # to drop the long tail of timestamp/order-ID false
+                # positives that pass Luhn coincidentally.
+                is_dedicated_cc = log_parser.is_cc_file(member.filename)
+                is_cc_candidate = want_cc and (
+                    is_dedicated_cc
+                    or log_parser.is_password_file(member.filename)
+                )
+                cc_strict = not is_dedicated_cc
 
-                # Read once, parse for both cookies and credentials as
+                # Read once, parse for cookies + credentials + CCs as
                 # requested. Tabbed cookie files have no ``@`` lines so
                 # the ULP parser will skip them naturally.
                 try:
@@ -1524,6 +1542,22 @@ def _run_extraction_zip_stream(
                             continue
                         creds_seen.add(key)
                         creds.append(c)
+
+                if is_cc_candidate:
+                    for card in log_parser.parse_credit_cards(text, strict=cc_strict):
+                        existing = cc_by_num.get(card.number)
+                        if existing is None:
+                            cc_by_num[card.number] = card
+                            continue
+                        # Prefer the record with more fields filled in.
+                        def _ccscore(c: "log_parser.CreditCard") -> int:
+                            return (
+                                int(bool(c.mm))
+                                + int(bool(c.yy))
+                                + int(bool(c.cvv))
+                            )
+                        if _ccscore(card) > _ccscore(existing):
+                            cc_by_num[card.number] = card
 
                 if cookies:
                     # Group hits from this source file by target domain so
@@ -1580,6 +1614,13 @@ def _run_extraction_zip_stream(
                 )
             )
             cred_counts = _credential_counts(creds, domains, output_modes)
+
+        if want_cc and cc_by_num:
+            cards = list(cc_by_num.values())
+            output_files.extend(
+                _emit_cc_outputs(cards, domains, output_dir, progress)
+            )
+            cred_counts[CC_MODE] = len(cards)
 
         output_files = [
             p for p in output_files
@@ -1792,6 +1833,83 @@ def _credential_counts(
     return counts
 
 
+def _emit_cc_outputs(
+    cards: List["log_parser.CreditCard"],
+    domains: List[str],
+    output_dir: str,
+    progress: ExtractionProgress,
+) -> List[str]:
+    """Write the Luhn-validated CC file (``NUMBER|MM|YY|CVV`` per line).
+
+    Bumps ``progress.credentials_found`` by the number of cards written
+    so the live dashboard reflects CC results too.
+    """
+    out_files: List[str] = []
+    if not cards:
+        return out_files
+    body = log_parser.format_cc(cards)
+    if not body.strip():
+        return out_files
+    slug = _safe_domain_label(domains)
+    path = os.path.join(output_dir, f"{slug}_cc.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        progress.credentials_found += len(cards)
+        out_files.append(path)
+    except OSError:
+        logger.exception("Failed to write CC output {}", path)
+    return out_files
+
+
+def _collect_cc_from_dir(
+    root: str,
+    progress: ExtractionProgress,
+) -> List["log_parser.CreditCard"]:
+    """Walk *root* and collect deduped Luhn-valid CCs.
+
+    Scans password files + dedicated CC files (CreditCards.txt etc.).
+    """
+    by_num: Dict[str, "log_parser.CreditCard"] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            if progress.cancelled:
+                return list(by_num.values())
+            fpath = os.path.join(dirpath, fname)
+            if not (
+                log_parser.is_cc_file(fpath)
+                or log_parser.is_password_file(fpath)
+            ):
+                continue
+            try:
+                if os.path.getsize(fpath) > MAX_TEXT_SCAN_BYTES:
+                    continue
+                with open(fpath, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            strict = not log_parser.is_cc_file(fpath)
+            for card in log_parser.parse_credit_cards(text, strict=strict):
+                existing = by_num.get(card.number)
+                if existing is None:
+                    by_num[card.number] = card
+                    continue
+
+                def _ccscore(c: "log_parser.CreditCard") -> int:
+                    return (
+                        int(bool(c.mm))
+                        + int(bool(c.yy))
+                        + int(bool(c.cvv))
+                    )
+                if _ccscore(card) > _ccscore(existing):
+                    by_num[card.number] = card
+    return list(by_num.values())
+
+
 def _run_extraction(
     archive_path: str,
     domain: Union[str, Iterable[str]],
@@ -1948,6 +2066,13 @@ def _run_extraction(
                 )
             )
             cred_counts = _credential_counts(creds, domains, output_modes)
+
+        if CC_MODE in output_modes:
+            cards = _collect_cc_from_dir(temp_dir, progress)
+            output_files.extend(
+                _emit_cc_outputs(cards, domains, output_dir, progress)
+            )
+            cred_counts[CC_MODE] = len(cards)
 
         # Drop empty output files (shouldn't happen, but belt-and-braces).
         output_files = [
