@@ -908,7 +908,10 @@ async def _process_job(
                      InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
                 ]),
             )
-            if not result.partial:
+            # Only ping the admin for code-bug-shaped failures. Bad
+            # archives, non-UTF8 filenames, disk-full, wrong passwords, …
+            # all set ``recoverable=True`` and don't need a critical alert.
+            if not result.partial and not getattr(result, "recoverable", False):
                 _notify_admin_error(context, user_id, "extraction", result.error)
             return
 

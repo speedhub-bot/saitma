@@ -21,7 +21,9 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Union
+from typing import (
+    Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union,
+)
 
 from loguru import logger
 
@@ -324,6 +326,62 @@ class ExtractionResult:
     # Per-output-mode counts so the user-facing summary can show
     # ``2,431 ULP / 187 claude.ai combos``.
     credential_counts: Dict[str, int] = field(default_factory=dict)
+    # True when ``error`` came from a known content/environment issue
+    # (corrupt archive, non-UTF8 filename, disk full, wrong password, …)
+    # rather than a code bug. Callers use this to decide whether to
+    # spam the admin with a critical-error alert.
+    recoverable: bool = False
+
+
+def _friendly_extraction_error(exc: BaseException) -> Tuple[str, bool]:
+    """Translate raw exceptions into user-facing messages.
+
+    Returns ``(message, recoverable)``. ``recoverable=True`` means the
+    failure is a known content/environment issue (bad archive, non-UTF8
+    filenames, disk full, wrong password, …) — *not* a code bug, so the
+    admin doesn't need to be paged.
+    """
+    if isinstance(exc, UnicodeDecodeError):
+        return (
+            "Archive contained non-UTF8 filenames or text. Most files were "
+            "still processed; some entries with garbled names were skipped.",
+            True,
+        )
+    if isinstance(exc, FileNotFoundError):
+        return (f"Required file missing: {exc}", True)
+    if isinstance(exc, PermissionError):
+        return (
+            "Permission denied while reading or writing extraction files.",
+            True,
+        )
+    if isinstance(exc, OSError):
+        # Disk full, ENOSPC, broken pipe, etc. — environment, not code.
+        errno_str = f" (errno {exc.errno})" if getattr(exc, "errno", None) else ""
+        return (f"OS error during extraction{errno_str}: {exc}", True)
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    recoverable_markers = (
+        "wrong password",
+        "bad password",
+        "is not encrypted",
+        "no files to extract",
+        "extraction failed",
+        "unrar exited with code",
+        "7z exited with code",
+        "rar: ",
+        "7z: ",
+        "patoolib: ",
+        "encrypted entries",
+        "crc",
+        "checksum",
+        "unsupported archive",
+        "not a zip",
+        "not a rar",
+        "corrupt",
+    )
+    if any(marker in low for marker in recoverable_markers):
+        return (msg, True)
+    return (msg, False)
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
@@ -445,7 +503,8 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
             try:
                 proc = subprocess.run(
                     [unrar, "lt", "-p-", archive_path],
-                    capture_output=True, text=True, timeout=60,
+                    capture_output=True, text=True, errors="replace",
+                    timeout=60,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
                 )
@@ -470,7 +529,8 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
         try:
             proc = subprocess.run(
                 [sz, "l", "-slt", archive_path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -829,7 +889,8 @@ def _extract_with_7z(
         try:
             count_proc = subprocess.run(
                 list_cmd,
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -873,6 +934,8 @@ def _extract_with_7z(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )
@@ -1013,7 +1076,8 @@ def _extract_with_unrar(
         try:
             count_proc = subprocess.run(
                 [unrar, "lb", pw_flag, archive_path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -1039,6 +1103,8 @@ def _extract_with_unrar(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )
@@ -1683,19 +1749,29 @@ def _collect_credentials_from_zip(
     """
     creds: List[log_parser.Credential] = []
     seen: Set = set()
-    for member in zf.infolist():
+    try:
+        members = list(zf.infolist())
+    except (UnicodeDecodeError, zipfile.BadZipFile, OSError) as exc:
+        logger.warning(
+            "zip infolist failed ({}); credentials skipped", exc,
+        )
+        return creds
+    for member in members:
         if progress.cancelled:
             break
-        if member.is_dir():
-            continue
-        if not log_parser.is_password_file(member.filename):
-            continue
-        if member.file_size and member.file_size > MAX_TEXT_SCAN_BYTES:
+        try:
+            if member.is_dir():
+                continue
+            if not log_parser.is_password_file(member.filename):
+                continue
+            if member.file_size and member.file_size > MAX_TEXT_SCAN_BYTES:
+                continue
+        except (UnicodeDecodeError, AttributeError):
             continue
         try:
             with zf.open(member, "r") as fh:
                 raw = fh.read()
-        except (RuntimeError, zipfile.BadZipFile, OSError):
+        except (RuntimeError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
             continue
         try:
             text = raw.decode("utf-8", errors="ignore")
@@ -1930,6 +2006,13 @@ def _run_extraction(
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
+    # Initialise these at function scope so the catch-all ``except``
+    # below can still salvage anything that was already produced when
+    # a later phase blows up.
+    output_files: List[str] = []
+    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+    cred_counts: Dict[str, int] = {}
+
     try:
         # Fast path: plain (non-encrypted) zip → stream-decompress each
         # entry in memory and scan as we go, avoiding a full disk
@@ -1984,7 +2067,6 @@ def _run_extraction(
             d: re.sub(r"[^A-Za-z0-9._-]", "_", d) for d in domains
         }
         file_counters: Dict[str, int] = {d: 1 for d in domains}
-        per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
         for d in domains:
             os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
 
@@ -2046,7 +2128,6 @@ def _run_extraction(
         # Phase 3: bundle per-source .txt files into one zip per domain.
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files: List[str] = []
         if COOKIE_MODE in output_modes:
             output_files.extend(
                 _bundle_all_zips(per_source_dir, output_dir, domains)
@@ -2057,7 +2138,6 @@ def _run_extraction(
 
         # Optional phase 4: scan the same extracted tree for password
         # files and emit ULP / combo outputs.
-        cred_counts: Dict[str, int] = {}
         if output_modes & ALL_CREDENTIAL_MODES:
             creds = _collect_credentials_from_dir(temp_dir, progress)
             output_files.extend(
@@ -2112,10 +2192,25 @@ def _run_extraction(
     except Exception as exc:
         logger.exception("Extraction failed")
         progress.phase = "failed"
+        friendly, recoverable = _friendly_extraction_error(exc)
+        # Salvage anything we produced before the failure so the user
+        # still gets partial output instead of a bare error message.
+        salvaged = [
+            p for p in output_files
+            if os.path.exists(p) and os.path.getsize(p) > 0
+        ]
         return ExtractionResult(
-            success=False,
-            error=str(exc),
+            success=bool(salvaged),
+            output_files=salvaged,
+            cookies_found=progress.cookies_found,
+            files_scanned=progress.files_scanned,
             duration_seconds=time.monotonic() - start,
+            partial=bool(salvaged),
+            error=friendly,
+            per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
+            recoverable=recoverable,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
