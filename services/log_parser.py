@@ -503,3 +503,363 @@ def collect_credentials_from_dir(
                 seen.add(key)
                 out.append(c)
     return out
+
+
+# ── Credit card extraction (Luhn-validated) ─────────────────
+
+# We accept 13-19 digit sequences. The Luhn check then drops anything
+# that isn't a real card number. The two regexes are run in order:
+#   * ``_CC_RUN_RE``    — any 13-19 digit run (allowing spaces/dashes
+#                          as visual separators); MOST stealer logs
+#                          dump CCs like ``4111 1111 1111 1111`` or
+#                          ``4111-1111-1111-1111``.
+#   * ``_CC_FIELD_RE``  — labeled blocks (``Number: …``, ``Card #: …``).
+#                          Used to pair a CC with its exp date / CVV
+#                          when they sit on adjacent lines.
+_CC_RUN_RE = re.compile(
+    r"(?<![0-9])"
+    r"(\d(?:[ \-]?\d){12,18})"
+    r"(?![0-9])"
+)
+
+# Expiry-date patterns we'll try in order. Each MUST capture two
+# named groups, ``mm`` and ``yy``. Year may be 2 or 4 digits.
+_CC_EXP_PATTERNS: Tuple[re.Pattern, ...] = (
+    # MM/YY or MM/YYYY or MM-YY or MM-YYYY, optional spaces.
+    re.compile(
+        r"(?<![0-9])(?P<mm>0[1-9]|1[0-2])\s*[/\-\.]\s*"
+        r"(?P<yy>20\d{2}|\d{2})(?![0-9])"
+    ),
+    # MM YY (whitespace-only separator) — only after a clear "exp"
+    # context, to avoid grabbing random adjacent numbers. Guarded
+    # at the caller by `_find_exp_near`.
+    re.compile(
+        r"(?<![0-9])(?P<mm>0[1-9]|1[0-2])\s+(?P<yy>20\d{2}|\d{2})(?![0-9])"
+    ),
+)
+
+# CVV / CVV2 / CVC / Security code (3 or 4 digits).
+_CC_CVV_RE = re.compile(
+    r"(?i)(?:cvv2?|cvc2?|c\.?v\.?v|security\s*code|cv?n)\s*[:=#]?\s*"
+    r"(?<![0-9])(?P<cvv>\d{3,4})(?![0-9])"
+)
+
+# Labeled blocks (``Number:``, ``Card Number:``, ``CC:``, etc.).
+# When we find one we'll look ahead for an Exp / CVV line in the
+# same record (delimited by a blank line or the next label).
+_CC_NUMBER_LABEL_RE = re.compile(
+    r"(?im)^\s*"
+    r"(?:card(?:\s*(?:number|num|no|#))?|cc(?:\s*num(?:ber)?)?|"
+    r"number|num|pan)"
+    r"\s*[:=#]\s*"
+    r"(?P<num>[\d \-]{13,32})"
+    r"\s*$"
+)
+
+# Expiry / CVV labels we look for in the labeled block. We grab the
+# whole field including any leading punctuation so the exp regex
+# above can pick out mm / yy.
+_CC_EXP_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:exp(?:iry|ire|iration)?|expiry\s*date|valid|expdate)"
+    r"\s*[:=#]\s*(?P<v>.+?)\s*$"
+)
+_CC_CVV_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:cvv2?|cvc2?|c\.?v\.?v|cvn|security\s*code|"
+    r"card\s*verification)"
+    r"\s*[:=#]\s*(?P<v>\d{3,4})\s*$"
+)
+
+
+@dataclass(frozen=True)
+class CreditCard:
+    """One credit-card record parsed from a stealer log."""
+    number: str   # digits only, no spaces/dashes
+    mm: str       # zero-padded 2-char month, or "" if unknown
+    yy: str       # 2-char year (last 2 digits), or "" if unknown
+    cvv: str      # 3-4 digits, or "" if unknown
+
+    @property
+    def out_line(self) -> str:
+        """``NUMBER|MM|YY|CVV`` formatted pipe line."""
+        return f"{self.number}|{self.mm}|{self.yy}|{self.cvv}"
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Return True iff *digits* (a stripped CC string) passes Luhn."""
+    if not digits or len(digits) < 13 or len(digits) > 19:
+        return False
+    if not digits.isdigit():
+        return False
+    total = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        n = ord(ch) - 48
+        if i % 2 == parity:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
+def _is_known_iin(digits: str) -> bool:
+    """Quick sanity check that *digits* starts with a known card-brand IIN.
+
+    Used as a second filter after Luhn — most random 16-digit numbers
+    that pass Luhn don't start with a real BIN range. Covers Visa,
+    Mastercard (incl. 2-series), Amex, Discover, Diners, JCB, UnionPay.
+    """
+    n = digits
+    L = len(digits)
+    # Visa: starts with 4, 13/16/19 long.
+    if n[0] == "4" and L in (13, 16, 19):
+        return True
+    # Mastercard: 51-55, 16 long; 2221-2720, 16 long.
+    if L == 16:
+        if n.startswith(("51", "52", "53", "54", "55")):
+            return True
+        if n.startswith("2") and 2221 <= int(n[:4]) <= 2720:
+            return True
+    # Amex: 34 or 37, 15 long.
+    if L == 15 and n.startswith(("34", "37")):
+        return True
+    # Discover: 6011, 644-649, 65, 16 or 19 long.
+    if L in (16, 19):
+        if n.startswith("6011") or n.startswith("65"):
+            return True
+        if n.startswith("64") and n[2] in "456789":
+            return True
+    # Diners Club: 300-305, 36, 38, 39, 14 long (16/19 modern).
+    if L in (14, 16, 19):
+        if n.startswith("36") or n.startswith("38") or n.startswith("39"):
+            return True
+        if n.startswith("30") and n[2] in "012345":
+            return True
+    # JCB: 3528-3589, 16-19 long.
+    if 16 <= L <= 19 and n.startswith("35"):
+        if 3528 <= int(n[:4]) <= 3589:
+            return True
+    # UnionPay: 62, 16-19 long.
+    if 16 <= L <= 19 and n.startswith("62"):
+        return True
+    return False
+
+
+def _normalize_year(yy: str) -> str:
+    """Return 2-digit year. ``2025`` → ``25``, ``25`` → ``25``."""
+    yy = yy.strip()
+    if len(yy) == 4 and yy.isdigit():
+        return yy[2:]
+    if len(yy) == 2 and yy.isdigit():
+        return yy
+    return ""
+
+
+def _find_exp_near(text: str, start: int, end: int) -> Tuple[str, str]:
+    """Return ``(mm, yy)`` for the closest expiry-date match around
+    ``[start, end]`` in *text*. Empty strings when none.
+
+    Searches a small window AFTER the CC (most common: ``CARD\\nEXP\\nCVV``)
+    then a small window BEFORE.
+    """
+    after = text[end:end + 200]
+    for pat in _CC_EXP_PATTERNS:
+        m = pat.search(after)
+        if m:
+            return m.group("mm"), _normalize_year(m.group("yy"))
+    before = text[max(0, start - 200):start]
+    for pat in _CC_EXP_PATTERNS:
+        m = pat.search(before)
+        if m:
+            return m.group("mm"), _normalize_year(m.group("yy"))
+    return "", ""
+
+
+def _find_cvv_near(text: str, start: int, end: int) -> str:
+    """Return CVV digits near the CC, empty if none in the window."""
+    after = text[end:end + 200]
+    m = _CC_CVV_RE.search(after)
+    if m:
+        return m.group("cvv")
+    before = text[max(0, start - 200):start]
+    m = _CC_CVV_RE.search(before)
+    if m:
+        return m.group("cvv")
+    return ""
+
+
+def _card_score(c: "CreditCard") -> int:
+    return int(bool(c.mm)) + int(bool(c.yy)) + int(bool(c.cvv))
+
+
+# Already-flattened combo shape produced by stealer aggregators:
+#   ``NUMBER|MM|YY|CVV``  (also accepts ``,`` / ``;`` / `\t` / `:` as
+#   field separators). The number itself may contain spaces or
+#   dashes as visual separators (``4111 1111 1111 1111``).
+_CC_COMBO_RE = re.compile(
+    r"(?<![0-9])"
+    r"(?P<num>\d(?:[ \-]?\d){12,18})"
+    r"\s*[|,:;\t]\s*"
+    r"(?P<mm>0?[1-9]|1[0-2])"
+    r"\s*[|,:;\t /\-]\s*"
+    r"(?P<yy>20\d{2}|\d{2})"
+    r"\s*[|,:;\t /\-]\s*"
+    r"(?P<cvv>\d{3,4})"
+    r"(?![0-9])"
+)
+
+
+def parse_credit_cards(
+    text: str,
+    *,
+    strict: bool = False,
+) -> List[CreditCard]:
+    """Extract all Luhn-valid credit cards (with nearby MM/YY/CVV) from *text*.
+
+    Strategy:
+      1. Run the pipe-combo regex first — stealer aggregators dump
+         cards in ``NUMBER|MM|YY|CVV`` shape and grabbing the whole
+         tuple in one pass is more accurate than searching a window.
+      2. Then find every 13-19 digit run elsewhere in the text.
+         Strip separators, run Luhn + IIN sanity check, search a
+         +/-200-char window for exp / CVV labels.
+      3. Dedupe by CC number — keep the most-complete record per
+         number (more filled fields wins).
+
+    When ``strict`` is True, a 13-19 digit run found OUTSIDE the
+    pipe-combo form must have at least one of MM/YY/CVV resolvable
+    from the surrounding window — this kills the long tail of
+    false positives where timestamps / order-IDs happen to pass
+    Luhn (e.g. ``2303200123032001``). Use ``strict=True`` when
+    scanning generic password files; use the default in dedicated
+    CC files.
+    """
+    by_num: Dict[str, CreditCard] = {}
+
+    def _store(card: CreditCard) -> None:
+        existing = by_num.get(card.number)
+        if existing is None or _card_score(card) > _card_score(existing):
+            by_num[card.number] = card
+
+    # Pass 1: NUMBER|MM|YY|CVV style combo lines. Always trusted —
+    # the combo shape itself proves the number is a CC, not a
+    # timestamp/ID.
+    for m in _CC_COMBO_RE.finditer(text):
+        digits = re.sub(r"[ \-]", "", m.group("num"))
+        if not _luhn_ok(digits):
+            continue
+        if not _is_known_iin(digits):
+            continue
+        mm = m.group("mm").zfill(2)
+        yy = _normalize_year(m.group("yy"))
+        cvv = m.group("cvv")
+        _store(CreditCard(number=digits, mm=mm, yy=yy, cvv=cvv))
+
+    # Pass 2: any 13-19 digit run, with metadata pulled from a
+    # surrounding window. Catches "labeled" shapes (Number: ... /
+    # Exp: ... / CVV: ...) and CCs sprinkled in passwords files.
+    for m in _CC_RUN_RE.finditer(text):
+        raw = m.group(1)
+        digits = re.sub(r"[ \-]", "", raw)
+        if not _luhn_ok(digits):
+            continue
+        if not _is_known_iin(digits):
+            continue
+        if digits in by_num and _card_score(by_num[digits]) == 3:
+            continue  # already have a fully-fleshed-out record
+        mm, yy = _find_exp_near(text, m.start(), m.end())
+        cvv = _find_cvv_near(text, m.start(), m.end())
+        if strict and not (mm or yy or cvv):
+            # No CC metadata anywhere near — almost certainly a
+            # timestamp or order-ID that coincidentally passes Luhn.
+            continue
+        _store(CreditCard(number=digits, mm=mm, yy=yy, cvv=cvv))
+
+    return list(by_num.values())
+
+
+def format_cc(cards: Iterable[CreditCard]) -> str:
+    """``NUMBER|MM|YY|CVV`` lines, sorted by number (stable, deduped)."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for c in sorted(cards, key=lambda x: x.number):
+        line = c.out_line
+        if line in seen:
+            continue
+        seen.add(line)
+        out.append(line)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+# Files that typically contain CCs inside a stealer log.
+_CC_FILE_NAMES: Tuple[str, ...] = (
+    "creditcards.txt", "credit_cards.txt", "credit cards.txt",
+    "cards.txt", "cc.txt", "ccs.txt", "ccfullz.txt", "fullz.txt",
+    "card.txt", "cards_list.txt", "cclist.txt", "bank.txt",
+    "billing.txt", "payment.txt", "payments.txt", "paymentcards.txt",
+)
+
+_CC_NAME_RE = re.compile(
+    r"\b(credit[\s_-]*cards?|cards?|cc|fullz|billing|payments?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_cc_file(path: str) -> bool:
+    """Return True if *path*'s basename looks like a CC dump file."""
+    base = os.path.basename(path).lower()
+    if base in _CC_FILE_NAMES:
+        return True
+    if not base.endswith((".txt", ".log")):
+        return False
+    return bool(_CC_NAME_RE.search(base))
+
+
+def collect_cc_from_dir(
+    root: str,
+    max_bytes_per_file: Optional[int] = None,
+    scan_all_text: bool = True,
+) -> List[CreditCard]:
+    """Walk *root*, parse every CC-looking file, return all valid cards.
+
+    When ``scan_all_text`` is True (default), ALSO scans any other
+    ``.txt`` file that looks generic (Passwords.txt, browser dumps,
+    etc.) — stealer dumps often inline CC data alongside passwords.
+    """
+    by_num: Dict[str, CreditCard] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            fpath = os.path.join(dirpath, fname)
+            lower = fname.lower()
+            is_cc = is_cc_file(fpath)
+            is_generic_txt = (
+                scan_all_text
+                and lower.endswith((".txt", ".log"))
+                and not is_cc
+                # skip enormous logs (browser history, etc.)
+            )
+            if not (is_cc or is_generic_txt):
+                continue
+            try:
+                if max_bytes_per_file is not None:
+                    if os.path.getsize(fpath) > max_bytes_per_file:
+                        continue
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for card in parse_credit_cards(text):
+                existing = by_num.get(card.number)
+                if existing is None:
+                    by_num[card.number] = card
+                    continue
+
+                def _score(c: CreditCard) -> int:
+                    return (
+                        int(bool(c.mm))
+                        + int(bool(c.yy))
+                        + int(bool(c.cvv))
+                    )
+                if _score(card) > _score(existing):
+                    by_num[card.number] = card
+    return list(by_num.values())

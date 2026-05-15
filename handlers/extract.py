@@ -35,6 +35,7 @@ from db import database as db
 from services.downloader import download_file, download_from_url
 from services.extractor import (
     ALL_CREDENTIAL_MODES,
+    CC_MODE,
     COMBO_FULL_MODE,
     COMBO_TARGETED_MODE,
     COOKIE_MODE,
@@ -59,6 +60,7 @@ _MODE_BUTTONS = [
     (ULP_MODE, "ULP url:user:pass", "\U0001f4dd"),
     (COMBO_TARGETED_MODE, "Combo (targeted)", "\U0001f3af"),
     (COMBO_FULL_MODE, "Combo (full)", "\U0001f4e6"),
+    (CC_MODE, "CC (Luhn)", "\U0001f4b3"),
 ]
 
 # Module-level job queue (initialised in register())
@@ -1049,6 +1051,11 @@ async def _process_job(
             summary += (
                 f"\U0001f4e6 Combo (full): "
                 f"{cred_counts.get(COMBO_FULL_MODE, 0):,}\n"
+            )
+        if CC_MODE in output_modes:
+            summary += (
+                f"\U0001f4b3 CC (Luhn-valid): "
+                f"{cred_counts.get(CC_MODE, 0):,}\n"
             )
         summary += (
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
