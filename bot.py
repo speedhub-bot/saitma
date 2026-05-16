@@ -233,7 +233,12 @@ def main() -> None:
 
             await application.bot.set_my_commands([
                 BotCommand("start", "Open the main menu"),
-                BotCommand("extract", "Extract cookies from an archive"),
+                BotCommand("cookies", "Extract cookies for a domain"),
+                BotCommand("ulp", "Extract url:user:pass from logs"),
+                BotCommand("combo", "Combo (targeted) - user:pass for a domain"),
+                BotCommand("combo_full", "Combo (full) - user:pass grouped by host"),
+                BotCommand("cc", "Extract Luhn-valid credit cards"),
+                BotCommand("extract", "Mix modes (pick multiple)"),
                 BotCommand("mystats", "Show your usage stats"),
                 BotCommand("help", "How to use the bot"),
                 BotCommand("about", "About this bot / credits"),
