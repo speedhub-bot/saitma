@@ -766,29 +766,44 @@ def _is_split_archive(path: str) -> bool:
 
 
 # Magic-byte signatures used to detect the *actual* archive format,
-# regardless of the filename extension the user sent.
+# regardless of the filename extension the user sent. Order matters
+# only for prefix-collision avoidance (none here today).
 _MAGIC_SIGNATURES: List[tuple[bytes, str]] = [
-    (b"PK\x03\x04", "zip"),         # standard zip
-    (b"PK\x05\x06", "zip"),         # empty zip (EOCD only)
-    (b"PK\x07\x08", "zip"),         # spanned zip data descriptor
-    (b"Rar!\x1a\x07\x00", "rar"),   # RAR 1.5+
-    (b"Rar!\x1a\x07\x01\x00", "rar"),  # RAR 5.0
-    (b"7z\xbc\xaf\x27\x1c", "7z"),  # 7z
-    (b"\x1f\x8b", "gz"),            # gzip / .tar.gz
-    (b"BZh", "bz2"),                # bzip2 / .tar.bz2
-    (b"\xfd7zXZ\x00", "xz"),        # xz / .tar.xz
+    (b"PK\x03\x04", "zip"),                   # standard zip
+    (b"PK\x05\x06", "zip"),                   # empty zip (EOCD only)
+    (b"PK\x07\x08", "zip"),                   # spanned zip data descriptor
+    (b"Rar!\x1a\x07\x00", "rar"),             # RAR 1.5+
+    (b"Rar!\x1a\x07\x01\x00", "rar"),         # RAR 5.0
+    (b"7z\xbc\xaf\x27\x1c", "7z"),            # 7z
+    (b"\x1f\x8b", "gz"),                      # gzip / .tar.gz
+    (b"BZh", "bz2"),                          # bzip2 / .tar.bz2
+    (b"\xfd7zXZ\x00", "xz"),                  # xz / .tar.xz
+    (b"\x28\xb5\x2f\xfd", "zstd"),            # zstandard / .tar.zst
+    (b"\x04\x22\x4d\x18", "lz4"),             # lz4 frame
+    (b"LZIP", "lz"),                          # lzip
+    (b"\x5d\x00\x00", "lzma"),                # raw lzma (alone)
+    (b"MSCF", "cab"),                         # Microsoft Cabinet
+    (b"!<arch>\n", "ar"),                     # ar / .deb
+    (b"\xed\xab\xee\xdb", "rpm"),             # RPM
+    (b"\x60\xea", "arj"),                     # ARJ
+    (b"\x07\x07\x07", "cpio"),                # CPIO (binary)
+    (b"070701", "cpio"),                      # CPIO (newc ASCII)
+    (b"070702", "cpio"),                      # CPIO (crc ASCII)
+    (b"070707", "cpio"),                      # CPIO (odc ASCII)
 ]
 
 
 def _sniff_archive_type(path: str) -> Optional[str]:
     """Return a normalised archive-type tag based on file magic bytes.
 
-    Returns one of: "zip", "rar", "7z", "gz", "bz2", "xz", or None
-    if the file is empty / unreadable / unrecognised.
+    Returns one of: ``"zip"``, ``"rar"``, ``"7z"``, ``"gz"``, ``"bz2"``,
+    ``"xz"``, ``"zstd"``, ``"lz4"``, ``"lz"``, ``"lzma"``, ``"cab"``,
+    ``"ar"``, ``"rpm"``, ``"arj"``, ``"cpio"`` — or ``None`` if the file
+    is empty / unreadable / unrecognised.
     """
     try:
         with open(path, "rb") as f:
-            head = f.read(8)
+            head = f.read(16)
     except OSError:
         return None
     if not head:
@@ -797,6 +812,39 @@ def _sniff_archive_type(path: str) -> Optional[str]:
         if head.startswith(sig):
             return kind
     return None
+
+
+# Lowercased extensions for which we treat the upload as a single-file
+# "archive" — i.e. don't run any decompression, just copy the file into
+# the extraction dir and let the scanner walk it. Keep in sync with
+# :data:`utils.validators.SUPPORTED_TEXT_EXTENSIONS`.
+_PLAIN_TEXT_EXTENSIONS: tuple[str, ...] = (
+    ".txt", ".log", ".logs", ".csv", ".tsv",
+    ".json", ".jsonl", ".ndjson",
+    ".xml", ".html", ".htm",
+    ".yaml", ".yml", ".toml",
+    ".ini", ".conf", ".cfg",
+    ".md", ".markdown",
+    ".nfo", ".lst", ".list",
+    ".dat", ".out", ".dump", ".properties",
+)
+
+
+def _looks_like_plain_text(path: str) -> bool:
+    """Return True iff *path* is a plain-text upload we should scan in place.
+
+    A file qualifies when:
+      * its extension is in :data:`_PLAIN_TEXT_EXTENSIONS`, AND
+      * its magic bytes do **not** match any known archive format.
+
+    The magic-byte check stops a malicious / accidentally-wrong rename
+    (``passwords.rar`` saved as ``passwords.txt``) from skipping the
+    real extractor.
+    """
+    lower = path.lower()
+    if not any(lower.endswith(ext) for ext in _PLAIN_TEXT_EXTENSIONS):
+        return False
+    return _sniff_archive_type(path) is None
 
 
 class _DirCountPoller:
@@ -1373,17 +1421,50 @@ def _extract_archive(
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
-    """Return the archive-kind tag implied by a (lowercased) filename."""
-    if lower_path.endswith(".zip"):
+    """Return the archive-kind tag implied by a (lowercased) filename.
+
+    Tags match those returned by :func:`_sniff_archive_type` so callers
+    can compare the on-disk magic-byte format with the filename hint.
+    """
+    if lower_path.endswith((".zip", ".zipx", ".jar", ".war",
+                            ".ear", ".apk", ".ipa", ".xpi")):
         return "zip"
-    if lower_path.endswith((".tar.gz", ".tgz")):
+    if lower_path.endswith((".tar.gz", ".tgz", ".gz")):
         return "gz"
-    if lower_path.endswith(".tar.bz2"):
+    if lower_path.endswith((".tar.bz2", ".tbz", ".tbz2", ".bz2")):
         return "bz2"
+    if lower_path.endswith((".tar.xz", ".txz", ".xz")):
+        return "xz"
+    if lower_path.endswith((".tar.zst", ".tzst", ".zst", ".zstd")):
+        return "zstd"
+    if lower_path.endswith((".tar.lz4", ".lz4")):
+        return "lz4"
+    if lower_path.endswith((".tar.lz", ".tlz", ".lz")):
+        return "lz"
+    if lower_path.endswith((".tar.lzma", ".lzma")):
+        return "lzma"
     if lower_path.endswith(".rar"):
         return "rar"
     if lower_path.endswith(".7z"):
         return "7z"
+    if lower_path.endswith(".cab"):
+        return "cab"
+    if lower_path.endswith(".iso"):
+        return "iso"
+    if lower_path.endswith(".arj"):
+        return "arj"
+    if lower_path.endswith(".ace"):
+        return "ace"
+    if lower_path.endswith(".cpio"):
+        return "cpio"
+    if lower_path.endswith((".ar", ".deb")):
+        return "ar"
+    if lower_path.endswith(".rpm"):
+        return "rpm"
+    if lower_path.endswith(".dmg"):
+        return "dmg"
+    if lower_path.endswith(".tar"):
+        return "tar"
     return None
 
 
@@ -2014,10 +2095,31 @@ def _run_extraction(
     cred_counts: Dict[str, int] = {}
 
     try:
-        # Fast path: plain (non-encrypted) zip → stream-decompress each
+        # Fast path A: plain text / log upload → there's nothing to
+        # decompress, just symlink the file into the extraction dir
+        # and let the scanner walk it. Mirrors what we'd do for an
+        # archive that contained a single ``.txt`` member.
+        if _looks_like_plain_text(archive_path):
+            progress.phase = "extracting"
+            progress.extract_start = time.monotonic()
+            progress.extract_total = 1
+            base = os.path.basename(archive_path) or "upload.txt"
+            staged = os.path.join(temp_dir, base)
+            try:
+                os.symlink(archive_path, staged)
+            except OSError:
+                shutil.copy2(archive_path, staged)
+            progress.extract_current = 1
+            progress.current_file = base
+            logger.info(
+                "Plain-text upload detected ({}); skipping extraction",
+                archive_path,
+            )
+
+        # Fast path B: plain (non-encrypted) zip → stream-decompress each
         # entry in memory and scan as we go, avoiding a full disk
         # extraction. Mirrors u.txt's extractZipStreaming pattern.
-        if (
+        elif (
             password is None
             and _sniff_archive_type(archive_path) == "zip"
             and not _probe_encrypted_entries(archive_path)
@@ -2027,15 +2129,16 @@ def _run_extraction(
                 output_modes=output_modes,
             )
 
-        # Phase 1: extract archive
-        progress.phase = "extracting"
-        progress.extract_start = time.monotonic()
-        progress.current_file = ""
-        logger.info(
-            "Extracting archive {} into {} for domains={}",
-            archive_path, temp_dir, domains,
-        )
-        _extract_archive(archive_path, temp_dir, progress, password=password)
+        else:
+            # Phase 1: extract archive
+            progress.phase = "extracting"
+            progress.extract_start = time.monotonic()
+            progress.current_file = ""
+            logger.info(
+                "Extracting archive {} into {} for domains={}",
+                archive_path, temp_dir, domains,
+            )
+            _extract_archive(archive_path, temp_dir, progress, password=password)
 
         if progress.cancelled:
             # Nothing useful to send if the user cancelled mid-extraction.
