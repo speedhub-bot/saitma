@@ -886,8 +886,9 @@ def parse_credit_cards(
     When ``strict`` is True (the default), a 13-19 digit run found
     OUTSIDE the pipe-combo form must have BOTH:
       * a CC-related keyword (``card``, ``cvv``, ``exp``, ``visa``,
-        ``fullz``, ...) within ±400 chars, AND
-      * at least one of MM/YY/CVV resolvable from the ±200-char window.
+        ``fullz``, ...) within ±:data:`_KEYWORD_WINDOW` chars, AND
+      * at least one of MM/YY/CVV resolvable from the ±:data:`_EXP_WINDOW`
+        / ±:data:`_CVV_WINDOW`-char windows.
     This kills the long tail of false positives where timestamps /
     order-IDs happen to pass Luhn (e.g. ``2303200123032001``).
     Pipe-combo matches are exempt because the shape itself proves
