@@ -4,7 +4,12 @@ Production-grade Telegram bot for extracting cookies from Netscape-format archiv
 
 ## Features
 
-- **Cookie Extraction** — Extracts domain-specific cookies from `.zip`, `.rar`, `.7z`, `.tar.gz` archives. Routing is by **content (magic bytes)**, not extension, so a `.zip`-named 7z file still extracts cleanly.
+- **Cookie Extraction** — Extracts domain-specific cookies from a wide range of inputs:
+  - **Archives** — `.zip`, `.zipx`, `.jar`, `.war`, `.ear`, `.apk`, `.ipa`, `.xpi`, `.rar`, `.7z`, `.tar`, `.tar.gz` (`.tgz`), `.tar.bz2` (`.tbz`/`.tbz2`), `.tar.xz` (`.txz`), `.tar.zst` (`.tzst`), `.tar.lz` (`.tlz`), `.tar.lzma`, `.tar.lz4`, plus single-stream `.gz`, `.bz2`, `.xz`, `.zst`/`.zstd`, `.lz`, `.lzma`, `.lz4`, `.z`, and container formats `.cab`, `.iso`, `.arj`, `.ace`, `.cpio`, `.ar`, `.deb`, `.rpm`, `.dmg`.
+  - **Plain logs** — `.txt`, `.log`, `.logs`, `.csv`, `.tsv`, `.json`, `.jsonl`/`.ndjson`, `.xml`, `.html`/`.htm`, `.yaml`/`.yml`, `.toml`, `.ini`/`.conf`/`.cfg`, `.md`/`.markdown`, `.nfo`, `.lst`/`.list`, `.dat`, `.out`, `.dump`, `.properties` — scanned directly, no archive needed.
+  - **Split / multi-volume archives** — `.001`, `.002`, ... `.r01`, `.z01`, `.partN.rar` reassembled automatically.
+  Routing is by **content (magic bytes)**, not extension, so a `.zip`-named 7z file still extracts cleanly.
+- **Strict credit-card validation** — Cards must pass Luhn + a known IIN/BIN range (Visa, Mastercard incl. 2-series, Amex, Discover, Diners, JCB, UnionPay), are screened against published test-card numbers (Stripe / Adyen / etc.), rejected for low-entropy / repeated-digit / counting sequences, and (in strict mode) require a CC-related keyword + at least one of MM/YY/CVV in a ±400-char window. Expiry months/years are sanity-checked against the current year.
 - **Multi-domain Extraction** — Submit several domains at once (e.g. `spotify.com, netflix.com, crunchyroll.com`) and the bot scans the archive once, producing a separate result file per domain. Configurable via `MAX_DOMAINS_PER_EXTRACT` (default `10`).
 - **Live Dashboard** — Per-phase progress: download speed/ETA, extraction file counter (`current/total`), scanning files-per-second, **live cookies-found counter**, and the file currently being processed. Refreshes every 2 s.
 - **Cancel-with-partial-results** — Hit cancel on a running job and the bot still ships whatever cookies it has already found, captioned as partial results.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
@@ -645,6 +646,145 @@ def _is_known_iin(digits: str) -> bool:
     return False
 
 
+# ── Junk / sanity filters ───────────────────────────────────
+#
+# Even after Luhn + IIN, a non-trivial number of false-positive CC
+# numbers slip through because:
+#   * test/dev card numbers ("4242 4242 4242 4242") are placeholders;
+#   * repeated-digit and counting sequences happen to pass Luhn at
+#     some lengths;
+#   * timestamps and order-IDs occasionally satisfy Luhn (the
+#     16-digit space has a 10% Luhn hit rate by definition).
+#
+# These helpers reject the obvious cases.
+
+# Visa, Mastercard, and Stripe-published test card prefixes. These are
+# the ones every payments doc embeds; they pollute every CC export.
+_TEST_CARD_NUMBERS: Set[str] = {
+    # Visa
+    "4111111111111111", "4012888888881881", "4222222222222",
+    "4000000000000002", "4000000000000010", "4000000000000028",
+    "4000000000000036", "4000000000000044", "4000000000000051",
+    "4000000000000069", "4000000000000077", "4000000000000085",
+    "4000000000000093", "4000000000000119", "4000000000000127",
+    "4000000000000135", "4000000000000143", "4000000000000150",
+    "4000000000000168", "4000000000000176", "4000000000000184",
+    "4000000000000192", "4000000000000259", "4000000000000341",
+    "4242424242424242", "4012000033330026",
+    # Mastercard
+    "5555555555554444", "5105105105105100", "5200828282828210",
+    "2223003122003222", "2223000048400011",
+    # Amex
+    "378282246310005", "371449635398431",
+    # Discover
+    "6011111111111117", "6011000990139424",
+    # Diners / JCB / UnionPay
+    "30569309025904", "38520000023237", "3530111333300000",
+    "3566002020360505", "6200000000000005",
+}
+
+
+def _is_junk_digits(digits: str) -> bool:
+    """Reject obvious non-card patterns that nonetheless pass Luhn.
+
+    Catches:
+      * known published test/dev card numbers (Stripe / Adyen / etc.);
+      * sequences of a single repeated digit (``4444444444444444``);
+      * strictly increasing/decreasing single-step runs
+        (``1234567890123452``);
+      * runs with fewer than 4 unique digits (almost certainly an
+        ID or marker, not a real PAN).
+    """
+    if not digits:
+        return True
+    if digits in _TEST_CARD_NUMBERS:
+        return True
+    # All-same-digit (``4444...``).
+    if len(set(digits)) == 1:
+        return True
+    # Strictly ascending / descending runs.
+    diffs = {int(digits[i + 1]) - int(digits[i]) for i in range(len(digits) - 1)}
+    if diffs in ({1}, {-1}):
+        return True
+    # Very low entropy: fewer than 4 distinct digits across 13-19 chars
+    # is overwhelmingly an ID / phone number / serial.
+    if len(set(digits)) < 4:
+        return True
+    return False
+
+
+def _exp_looks_plausible(mm: str, yy: str) -> bool:
+    """Return True iff a parsed ``(mm, yy)`` expiry looks like a real card.
+
+    * Month must be 01-12.
+    * Year must be within ``current_year - 1 .. current_year + 15``
+      (we tolerate one year of staleness so freshly-expired cards
+      still appear; future cards are capped at ~15y).
+
+    A blank expiry is treated as "no info, can't reject on this basis".
+    """
+    if not mm or not yy:
+        return True
+    if not (mm.isdigit() and yy.isdigit()):
+        return False
+    m = int(mm)
+    if m < 1 or m > 12:
+        return False
+    y = int(yy)
+    if 0 <= y <= 99:
+        full = 2000 + y
+    else:
+        full = y
+    current_year = datetime.now(timezone.utc).year
+    return (current_year - 1) <= full <= (current_year + 15)
+
+
+_CVV_NUMERIC_RE = re.compile(r"^\d{3,4}$")
+
+
+def _cvv_looks_plausible(cvv: str) -> bool:
+    """Reject obviously-junk CVVs (000, 0000) — keep everything else."""
+    if not cvv:
+        return True
+    if not _CVV_NUMERIC_RE.match(cvv):
+        return False
+    if cvv == "0" * len(cvv):
+        return False
+    return True
+
+
+# Words that, if found within ~400 chars of a digit-run, strongly
+# suggest the run is intended to be a credit card. Used as an extra
+# disambiguator in strict mode so order-IDs/timestamps stop sneaking
+# through.
+_CC_KEYWORD_RE = re.compile(
+    r"(?i)\b(?:"
+    r"card(?:\s*(?:number|num|no|holder))?"
+    r"|credit|debit"
+    r"|visa|master\s*card|mastercard|amex|american\s*express"
+    r"|discover|diners|jcb|union\s*pay"
+    r"|maestro|rupay"
+    r"|pan|cardholder"
+    r"|exp(?:iry|ire|iration)?|expdate|valid\s*thru"
+    r"|cvv2?|cvc2?|cvn|security\s*code"
+    r"|fullz|billing|payment"
+    r")\b"
+)
+
+
+def _has_cc_keyword_near(text: str, start: int, end: int) -> bool:
+    """Return True iff a CC-related keyword appears in a tight window
+    around ``[start, end]`` (see :data:`_KEYWORD_WINDOW`).
+
+    The window is intentionally small (~80 chars, ~1-2 lines) so a
+    completely unrelated mention of ``card`` or ``cvv`` 5+ lines away
+    doesn't validate an otherwise-random digit run.
+    """
+    lo = max(0, start - _KEYWORD_WINDOW)
+    hi = min(len(text), end + _KEYWORD_WINDOW)
+    return bool(_CC_KEYWORD_RE.search(text, lo, hi))
+
+
 def _normalize_year(yy: str) -> str:
     """Return 2-digit year. ``2025`` → ``25``, ``25`` → ``25``."""
     yy = yy.strip()
@@ -655,19 +795,26 @@ def _normalize_year(yy: str) -> str:
     return ""
 
 
+_EXP_WINDOW = 120
+_CVV_WINDOW = 120
+_KEYWORD_WINDOW = 80
+
+
 def _find_exp_near(text: str, start: int, end: int) -> Tuple[str, str]:
     """Return ``(mm, yy)`` for the closest expiry-date match around
     ``[start, end]`` in *text*. Empty strings when none.
 
     Searches a small window AFTER the CC (most common: ``CARD\\nEXP\\nCVV``)
-    then a small window BEFORE.
+    then a small window BEFORE. The window is intentionally narrow so
+    an expiry that belongs to a *different* card a few lines away
+    doesn't get mis-attributed.
     """
-    after = text[end:end + 200]
+    after = text[end:end + _EXP_WINDOW]
     for pat in _CC_EXP_PATTERNS:
         m = pat.search(after)
         if m:
             return m.group("mm"), _normalize_year(m.group("yy"))
-    before = text[max(0, start - 200):start]
+    before = text[max(0, start - _EXP_WINDOW):start]
     for pat in _CC_EXP_PATTERNS:
         m = pat.search(before)
         if m:
@@ -677,11 +824,11 @@ def _find_exp_near(text: str, start: int, end: int) -> Tuple[str, str]:
 
 def _find_cvv_near(text: str, start: int, end: int) -> str:
     """Return CVV digits near the CC, empty if none in the window."""
-    after = text[end:end + 200]
+    after = text[end:end + _CVV_WINDOW]
     m = _CC_CVV_RE.search(after)
     if m:
         return m.group("cvv")
-    before = text[max(0, start - 200):start]
+    before = text[max(0, start - _CVV_WINDOW):start]
     m = _CC_CVV_RE.search(before)
     if m:
         return m.group("cvv")
@@ -712,7 +859,7 @@ _CC_COMBO_RE = re.compile(
 def parse_credit_cards(
     text: str,
     *,
-    strict: bool = False,
+    strict: bool = True,
 ) -> List[CreditCard]:
     """Extract all Luhn-valid credit cards (with nearby MM/YY/CVV) from *text*.
 
@@ -726,13 +873,25 @@ def parse_credit_cards(
       3. Dedupe by CC number — keep the most-complete record per
          number (more filled fields wins).
 
-    When ``strict`` is True, a 13-19 digit run found OUTSIDE the
-    pipe-combo form must have at least one of MM/YY/CVV resolvable
-    from the surrounding window — this kills the long tail of
-    false positives where timestamps / order-IDs happen to pass
-    Luhn (e.g. ``2303200123032001``). Use ``strict=True`` when
-    scanning generic password files; use the default in dedicated
-    CC files.
+    Every candidate (in both passes) must clear:
+      * :func:`_luhn_ok` — Luhn check, 13-19 digits;
+      * :func:`_is_known_iin` — starts with a real card-brand IIN;
+      * :func:`_is_junk_digits` — not a test card, not a repeated /
+        counting / low-entropy sequence;
+      * :func:`_exp_looks_plausible` — month 01-12 and year within
+        ``current_year - 1 .. current_year + 15`` (only when an
+        expiry is attached);
+      * :func:`_cvv_looks_plausible` — drops all-zero CVVs.
+
+    When ``strict`` is True (the default), a 13-19 digit run found
+    OUTSIDE the pipe-combo form must have BOTH:
+      * a CC-related keyword (``card``, ``cvv``, ``exp``, ``visa``,
+        ``fullz``, ...) within ±400 chars, AND
+      * at least one of MM/YY/CVV resolvable from the ±200-char window.
+    This kills the long tail of false positives where timestamps /
+    order-IDs happen to pass Luhn (e.g. ``2303200123032001``).
+    Pipe-combo matches are exempt because the shape itself proves
+    intent.
     """
     by_num: Dict[str, CreditCard] = {}
 
@@ -750,9 +909,15 @@ def parse_credit_cards(
             continue
         if not _is_known_iin(digits):
             continue
+        if _is_junk_digits(digits):
+            continue
         mm = m.group("mm").zfill(2)
         yy = _normalize_year(m.group("yy"))
         cvv = m.group("cvv")
+        if not _exp_looks_plausible(mm, yy):
+            continue
+        if not _cvv_looks_plausible(cvv):
+            continue
         _store(CreditCard(number=digits, mm=mm, yy=yy, cvv=cvv))
 
     # Pass 2: any 13-19 digit run, with metadata pulled from a
@@ -765,14 +930,23 @@ def parse_credit_cards(
             continue
         if not _is_known_iin(digits):
             continue
+        if _is_junk_digits(digits):
+            continue
         if digits in by_num and _card_score(by_num[digits]) == 3:
             continue  # already have a fully-fleshed-out record
         mm, yy = _find_exp_near(text, m.start(), m.end())
         cvv = _find_cvv_near(text, m.start(), m.end())
-        if strict and not (mm or yy or cvv):
-            # No CC metadata anywhere near — almost certainly a
-            # timestamp or order-ID that coincidentally passes Luhn.
+        if not _exp_looks_plausible(mm, yy):
+            # Expiry is right there next to the number but obviously
+            # wrong — almost certainly noise.
             continue
+        if not _cvv_looks_plausible(cvv):
+            continue
+        if strict:
+            if not (mm or yy or cvv):
+                continue
+            if not _has_cc_keyword_near(text, m.start(), m.end()):
+                continue
         _store(CreditCard(number=digits, mm=mm, yy=yy, cvv=cvv))
 
     return list(by_num.values())

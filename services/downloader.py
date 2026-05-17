@@ -658,13 +658,22 @@ def _force_archive_extension(file_name: str) -> str:
 
     Keeps the rest of the extractor pipeline's extension-sniffing
     happy. The magic-byte sniffer in extractor.py is the final word on
-    format — this is just a hint.
+    format — this is just a hint. Recognises every archive / plain-log
+    / split-part shape the validator accepts so a downloaded
+    ``logs.txt`` or ``backup.7z.001`` isn't renamed to ``...zip``.
     """
+    # Local import to avoid circular module load with utils → services.
+    from utils.validators import (  # noqa: WPS433 (intentional local import)
+        SUPPORTED_EXTENSIONS,
+        is_split_archive_part,
+    )
+
     if not file_name:
         return "archive.zip"
-    if any(file_name.lower().endswith(ext) for ext in (
-        ".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar",
-    )):
+    lower = file_name.lower()
+    if any(lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+        return file_name
+    if is_split_archive_part(lower):
         return file_name
     if "." not in file_name:
         return file_name + ".zip"

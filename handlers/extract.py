@@ -558,7 +558,11 @@ async def _build_file_prompt(
         f"download URL (mega.nz, mediafire, gofile, upload.ee, "
         f"pixeldrain, krakenfiles, bunkr, dropmefiles, qiwi.gg, "
         f"send.cm, swisstransfer, zippyshare).\n"
-        f"Supported archives: .zip .rar .7z .tar.gz\n"
+        f"Supported uploads:\n"
+        f"\u2022 Archives: .zip .rar .7z .tar.gz .tar.bz2 .tar.xz .tar.zst "
+        f".zst .cab .iso .arj .deb .rpm .dmg \u2026\n"
+        f"\u2022 Plain logs: .txt .log .csv .json .xml .html .yaml \u2026\n"
+        f"\u2022 Split parts: .001 .002 \u2026 .r01 .z01 .part1.rar\n"
         f"Your limit: {limit_text} remaining today\n"
         f"Max file size: {max_file}"
     )
@@ -905,16 +909,20 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not _URL_RE.match(raw):
         await update.message.reply_text(
             "\u274c That doesn't look like a direct URL.\n"
-            "Send an archive file or paste an http(s) link to a .zip/.rar.",
+            "Send an archive (.zip / .rar / .7z / .tar.* / \u2026) or a "
+            "plain log (.txt / .log / .csv / \u2026) URL.",
             reply_markup=_cancel_kb(),
         )
         return FILE
 
     # Basic extension sanity check (HEAD probe is done by the worker).
+    # The validator already knows the full whitelist (archives, plain
+    # logs, multi-volume parts) so just defer to it.
     lower = raw.split("?", 1)[0].lower()
-    if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar.gz", ".tgz")):
+    ok, _ = validate_archive(lower, None)
+    if not ok:
         # Not fatal — CDN redirects often have no extension. Just warn.
-        logger.info("URL has no archive extension, trusting server: {}", raw)
+        logger.info("URL has no recognised extension, trusting server: {}", raw)
 
     is_admin = user.id == config.ADMIN_ID
     vip = await db.is_vip(user.id)
