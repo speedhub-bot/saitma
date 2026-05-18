@@ -35,6 +35,10 @@ BOT_CREDIT = "\U0001f338 Made with care \u2014 credits to @akaza_isnt"
 def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("\U0001f50d Extract Cookies", callback_data="extract")],
+        [InlineKeyboardButton(
+            "\U0001f4e6 Loot (tdata / Discord / Steam / combos)",
+            callback_data="loot",
+        )],
         [
             InlineKeyboardButton("\U0001f4ca My Stats", callback_data="mystats"),
             InlineKeyboardButton("\u2699\ufe0f Settings", callback_data="settings"),

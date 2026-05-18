@@ -25,6 +25,7 @@ import config
 from db import database as db
 from handlers import admin as admin_handlers
 from handlers import extract as extract_handlers
+from handlers import loot as loot_handlers
 from handlers import user as user_handlers
 from services.downloader import disconnect_pyrogram
 from services.queue import JobQueue
@@ -217,6 +218,7 @@ def main() -> None:
     # Register handlers (order matters — conversations first)
     user_handlers.register(app)
     extract_handlers.register(app, job_queue)
+    loot_handlers.register(app, job_queue)
     admin_handlers.register(app, job_queue)
 
     # Global error handler
@@ -234,6 +236,10 @@ def main() -> None:
             await application.bot.set_my_commands([
                 BotCommand("start", "Open the main menu"),
                 BotCommand("extract", "Extract cookies from an archive"),
+                BotCommand(
+                    "loot",
+                    "Loot tdata + Discord + Steam + ULP/combos",
+                ),
                 BotCommand("mystats", "Show your usage stats"),
                 BotCommand("help", "How to use the bot"),
                 BotCommand("about", "About this bot / credits"),

