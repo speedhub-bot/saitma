@@ -25,6 +25,7 @@ import config
 from db import database as db
 from handlers import admin as admin_handlers
 from handlers import extract as extract_handlers
+from handlers import loot as loot_handlers
 from handlers import user as user_handlers
 from services.downloader import disconnect_pyrogram
 from services.queue import JobQueue
@@ -217,6 +218,7 @@ def main() -> None:
     # Register handlers (order matters — conversations first)
     user_handlers.register(app)
     extract_handlers.register(app, job_queue)
+    loot_handlers.register(app, job_queue)
     admin_handlers.register(app, job_queue)
 
     # Global error handler
@@ -239,6 +241,10 @@ def main() -> None:
                 BotCommand("combo_full", "Combo (full) - user:pass grouped by host"),
                 BotCommand("cc", "Extract Luhn-valid credit cards"),
                 BotCommand("extract", "Mix modes (pick multiple)"),
+                BotCommand(
+                    "loot",
+                    "Loot tdata + Discord + Steam + ULP/combos",
+                ),
                 BotCommand("mystats", "Show your usage stats"),
                 BotCommand("help", "How to use the bot"),
                 BotCommand("about", "About this bot / credits"),
