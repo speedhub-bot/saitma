@@ -55,6 +55,18 @@ _LOOT_BUNDLE_LIMIT = getattr(
     config, "OUTPUT_CHUNK_SIZE_BYTES", 45 * 1024 * 1024,
 )
 
+# Loot scan bucket identifiers — used by handlers to request a subset
+# of the available scanners.
+LOOT_ALL = "loot_all"
+LOOT_TDATA = "loot_tdata"
+LOOT_DISCORD = "loot_discord"
+LOOT_STEAM = "loot_steam"
+LOOT_PASSWORDS = "loot_passwords"
+
+ALL_LOOT_BUCKETS = frozenset(
+    {LOOT_TDATA, LOOT_DISCORD, LOOT_STEAM, LOOT_PASSWORDS},
+)
+
 
 def _safe_label(value: str) -> str:
     """Sanitise *value* into something usable as a filename component."""
@@ -227,6 +239,9 @@ class LootExtractionConfig:
     validate: bool = False
     validate_discord: bool = True
     validate_steam: bool = True
+    # When non-empty, only the listed buckets are scanned. When empty
+    # (the default), ALL buckets run.
+    buckets: frozenset[str] = field(default_factory=frozenset)
 
 
 def _bundle_loot_dir(loot_out_dir: str, dest_zip: str) -> None:
@@ -362,7 +377,9 @@ def _run_loot_extraction(
             )
 
         progress.phase = "scanning"
-        result = loot_mod.scan_directory_for_loot(temp_dir)
+        result = loot_mod.scan_directory_for_loot(
+            temp_dir, buckets=settings.buckets or None,
+        )
         progress.files_scanned = result.scanned_files or 0
 
         # Network validation runs in the same thread via asyncio.run

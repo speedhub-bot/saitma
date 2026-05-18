@@ -51,9 +51,15 @@ from handlers.extract import (
     _maybe_prompt_for_password,
     _notify_admin_error,
 )
-from services.downloader import download_file, download_from_url
+from services.downloader import download_file, download_from_url, send_result_file
 from services.extractor import ExtractionProgress
 from services.loot_extractor import (
+    ALL_LOOT_BUCKETS,
+    LOOT_ALL,
+    LOOT_DISCORD,
+    LOOT_PASSWORDS,
+    LOOT_STEAM,
+    LOOT_TDATA,
     LootExtractionConfig,
     run_loot_extraction_async,
 )
@@ -62,7 +68,7 @@ from utils.formatting import bytes_human, progress_bar, seconds_human
 from utils.validators import validate_archive
 
 # ── Conversation states ────────────────────────────────────
-LOOT_FILE = 0
+LOOT_TYPE, LOOT_FILE = range(2)
 
 # Module-level job queue (initialised in :func:`register`)
 _job_queue: JobQueue | None = None
@@ -100,6 +106,35 @@ def _loot_cancel_kb() -> InlineKeyboardMarkup:
             "\u274c Cancel", callback_data="loot_cancel",
         )],
     ])
+
+
+# Bucket buttons shown in the sub-picker. ``(callback_data, label)``
+_LOOT_TYPE_BUTTONS = [
+    (LOOT_ALL, "\U0001f4e6 All Loot"),
+    (LOOT_TDATA, "\U0001f4f1 tdata (Telegram sessions)"),
+    (LOOT_DISCORD, "\U0001f3ae Discord tokens"),
+    (LOOT_STEAM, "\U0001f3ae Steam accounts"),
+    (LOOT_PASSWORDS, "\U0001f511 Passwords (ULP / combos)"),
+]
+
+
+def _loot_type_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"loot_pick:{cid}")]
+        for cid, label in _LOOT_TYPE_BUTTONS
+    ]
+    rows.append([InlineKeyboardButton(
+        "\u274c Cancel", callback_data="loot_cancel",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _buckets_from_pick(pick: str) -> frozenset[str]:
+    """Translate a sub-picker callback value to the set of scanner
+    bucket IDs the extractor should run."""
+    if pick == LOOT_ALL or not pick:
+        return frozenset()  # empty ⇒ all
+    return frozenset({pick})
 
 
 def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
@@ -260,10 +295,58 @@ async def loot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     target_domains = _parse_domain_arg(raw_args)
     context.user_data["loot_targets"] = target_domains  # type: ignore[index]
 
+    text = (
+        "\U0001f4e6 <b>Loot scan</b>\n\n"
+        "What do you want to extract?\n"
+        "Pick a category below, then send me the archive."
+    )
+    if target_domains:
+        text += (
+            "\n\nTargeted combos: "
+            + ", ".join(f"<code>{d}</code>" for d in target_domains)
+        )
+    msg = update.effective_message
+    if update.callback_query:
+        await update.callback_query.answer()
+        try:
+            await update.callback_query.edit_message_text(
+                text, reply_markup=_loot_type_kb(), parse_mode="HTML",
+            )
+        except Exception:
+            await msg.reply_text(
+                text, reply_markup=_loot_type_kb(), parse_mode="HTML",
+            )
+    else:
+        await msg.reply_text(
+            text, reply_markup=_loot_type_kb(), parse_mode="HTML",
+        )
+    return LOOT_TYPE
+
+
+async def loot_type_picked(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """User tapped one of the loot-type buttons → store the bucket
+    selection and move to the FILE state."""
+    q = update.callback_query
+    if q is None or q.data is None:
+        return LOOT_TYPE
+    await q.answer()
+    pick = q.data.split(":", 1)[1] if ":" in q.data else ""
+    buckets = _buckets_from_pick(pick)
+    context.user_data["loot_buckets"] = buckets  # type: ignore[index]
+
+    # Label for the status line
+    label_map = {b: lbl for b, lbl in _LOOT_TYPE_BUTTONS}
+    label = label_map.get(pick, "All Loot")
+
+    target_domains: List[str] = context.user_data.get(  # type: ignore[union-attr]
+        "loot_targets", [],
+    )
     extras: List[str] = []
     if target_domains:
         extras.append(
-            "Targeted combo lists will be generated for: "
+            "Targeted combos: "
             + ", ".join(target_domains)
         )
     extras.append(
@@ -271,19 +354,19 @@ async def loot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     text = (
-        "\U0001f4e6 Loot scan\n"
+        f"\U0001f4e6 <b>{label}</b>\n\n"
         "Send an archive (zip / rar / 7z / tar.gz) or paste a "
         "direct download URL.\n\n"
-        "I'll search it for:\n"
-        "  \u2022 Telegram tdata sessions\n"
-        "  \u2022 Discord tokens (live-checked)\n"
-        "  \u2022 Steam accounts (login + ssfn + maFile)\n"
-        "  \u2022 Saved passwords \u2192 ULP + combos\n\n"
         + "\n".join(extras)
     )
-    await update.effective_message.reply_text(
-        text, reply_markup=_loot_cancel_kb(),
-    )
+    try:
+        await q.edit_message_text(
+            text, reply_markup=_loot_cancel_kb(), parse_mode="HTML",
+        )
+    except Exception:
+        await update.effective_message.reply_text(
+            text, reply_markup=_loot_cancel_kb(), parse_mode="HTML",
+        )
     return LOOT_FILE
 
 
@@ -298,6 +381,9 @@ async def loot_file_received(
     target_domains: List[str] = context.user_data.get(  # type: ignore[union-attr]
         "loot_targets", [],
     )
+    buckets: frozenset[str] = context.user_data.get(  # type: ignore[union-attr]
+        "loot_buckets", frozenset(),
+    )
 
     # ── Case A: direct URL ──
     raw_text = (update.message.text or "").strip()
@@ -308,6 +394,7 @@ async def loot_file_received(
             file_name=_name_from_url(raw_text),
             file_size=0,
             target_domains=target_domains,
+            buckets=buckets,
         )
 
     # ── Case B: archive document ──
@@ -360,6 +447,7 @@ async def loot_file_received(
         file_name=doc.file_name or "archive",
         file_size=file_size,
         target_domains=target_domains,
+        buckets=buckets,
     )
 
 
@@ -386,6 +474,7 @@ async def _enqueue_loot_job(
     file_name: str,
     file_size: int,
     target_domains: List[str],
+    buckets: frozenset[str] = frozenset(),
 ) -> int:
     """Create a DB job, build the worker coro, enqueue on the shared
     JobQueue. Returns ConversationHandler.END so caller can return it
@@ -408,6 +497,7 @@ async def _enqueue_loot_job(
         await _process_loot_job(
             update, context, job_id, user_id, source,
             progress_msg, progress, target_domains,
+            buckets=buckets,
         )
 
     is_admin = user_id == config.ADMIN_ID
@@ -439,6 +529,8 @@ async def _process_loot_job(
     progress_msg,
     progress: ExtractionProgress,
     target_domains: List[str],
+    *,
+    buckets: frozenset[str] = frozenset(),
 ) -> None:
     """Queue-worker body: download → maybe-prompt-password → run loot
     extractor → ship the resulting zip."""
@@ -499,6 +591,7 @@ async def _process_loot_job(
         settings = LootExtractionConfig(
             target_domains=target_domains,
             validate=config.LOOT_VALIDATE,
+            buckets=buckets,
         )
         er, lr = await run_loot_extraction_async(
             archive_path, progress, settings, password=password,
@@ -558,19 +651,23 @@ async def _process_loot_job(
         await db.increment_user_stats(user_id, 0, archive_size)
 
         caption = _summary_caption(lr)
+        try:
+            await progress_msg.edit_text(
+                "\U0001f4e4 Uploading results…",
+                reply_markup=_cancel_job_kb(job_id),
+            )
+        except Exception:
+            pass
         for fpath in er.output_files:
-            try:
-                if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
-                    with open(fpath, "rb") as fh:
-                        await context.bot.send_document(
-                            chat_id=user_id,
-                            document=fh,
-                            filename=os.path.basename(fpath),
-                            caption=caption,
-                        )
-                    caption = None  # only caption the first file
-            except Exception:
-                logger.exception("Failed to send loot file {}", fpath)
+            ok = await send_result_file(
+                context,
+                user_id,
+                fpath,
+                caption=caption,
+                status_msg=progress_msg,
+            )
+            if ok:
+                caption = None  # only caption the first file
 
         # Final status line in chat — replace the live dashboard.
         try:
@@ -652,6 +749,12 @@ def register(app, job_queue: JobQueue) -> None:
             CallbackQueryHandler(loot_entry, pattern="^loot$"),
         ],
         states={
+            LOOT_TYPE: [
+                CallbackQueryHandler(
+                    loot_type_picked, pattern=r"^loot_pick:",
+                ),
+                CallbackQueryHandler(cancel_loot, pattern="^loot_cancel$"),
+            ],
             LOOT_FILE: [
                 MessageHandler(filters.Document.ALL, loot_file_received),
                 MessageHandler(
