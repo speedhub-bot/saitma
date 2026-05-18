@@ -34,6 +34,12 @@ import config
 from db import database as db
 from services.downloader import download_file, download_from_url
 from services.extractor import (
+    ALL_CREDENTIAL_MODES,
+    CC_MODE,
+    COMBO_FULL_MODE,
+    COMBO_TARGETED_MODE,
+    COOKIE_MODE,
+    ULP_MODE,
     ExtractionProgress,
     guess_archive_password_async,
     probe_encrypted_entries_async,
@@ -45,7 +51,51 @@ from utils.formatting import bytes_human, progress_bar, seconds_human, time_unti
 from utils.validators import validate_archive, validate_domains
 
 # Conversation states
-DOMAIN, FILE = range(2)
+DOMAIN, MODE, FILE = range(3)
+
+# Available output modes, in keyboard order. Each entry is
+# ``(mode_id, short label, emoji)``.
+_MODE_BUTTONS = [
+    (COOKIE_MODE, "Cookies", "\U0001f36a"),
+    (ULP_MODE, "ULP url:user:pass", "\U0001f4dd"),
+    (COMBO_TARGETED_MODE, "Combo (targeted)", "\U0001f3af"),
+    (COMBO_FULL_MODE, "Combo (full)", "\U0001f4e6"),
+    (CC_MODE, "CC (Luhn)", "\U0001f4b3"),
+]
+
+# Single-mode shortcut buttons on the main menu — each callback_data
+# pre-selects exactly one output mode and skips the mode-picker step.
+_SINGLE_MODE_MAP: Dict[str, str] = {
+    "extract_mode_cookies": COOKIE_MODE,
+    "extract_mode_ulp": ULP_MODE,
+    "extract_mode_combo_targeted": COMBO_TARGETED_MODE,
+    "extract_mode_combo_full": COMBO_FULL_MODE,
+    "extract_mode_cc": CC_MODE,
+}
+
+# Convenience slash commands mapped to single-mode presets.
+_SLASH_CMD_MODE_MAP: Dict[str, str] = {
+    "/cookies": COOKIE_MODE,
+    "/ulp": ULP_MODE,
+    "/combo": COMBO_TARGETED_MODE,
+    "/combo_full": COMBO_FULL_MODE,
+    "/cc": CC_MODE,
+}
+
+# Modes that don't depend on the target domain — the user can skip the
+# domain prompt and we'll fall back to a generic ``logs`` placeholder
+# for output-file naming.
+_DOMAIN_INDEPENDENT_MODES = frozenset({ULP_MODE, COMBO_FULL_MODE, CC_MODE})
+
+# Placeholder domain used when a user picks a domain-independent mode
+# and taps "Skip" instead of typing a target.
+_DEFAULT_PLACEHOLDER_DOMAIN = "logs"
+
+# Match all single-mode callback_data values in one regex for the
+# ConversationHandler entry point.
+_SINGLE_MODE_CB_PATTERN = (
+    r"^(?:" + "|".join(re.escape(k) for k in _SINGLE_MODE_MAP) + r")$"
+)
 
 # Module-level job queue (initialised in register())
 _job_queue: JobQueue | None = None
@@ -90,6 +140,10 @@ class RescanEntry:
     password: Optional[str]
     expires_at: float                       # monotonic clock
     cleanup_task: "asyncio.Task[None]" = field(repr=False)
+    # Output modes the user picked on the original extraction. Reused
+    # for rescans so the second pass produces the same kind of output
+    # files as the first. None means "cookies only" (legacy default).
+    output_modes: Optional["frozenset[str]"] = None
 
 
 # user_id -> RescanEntry. At most one open rescan window per user.
@@ -132,6 +186,7 @@ def _register_rescan(
     file_size: int,
     window_seconds: float,
     password: Optional[str] = None,
+    output_modes: Optional["frozenset[str]"] = None,
 ) -> RescanEntry:
     """Register *archive_path* as a fresh rescan entry for *user_id*.
 
@@ -160,6 +215,7 @@ def _register_rescan(
         password=password,
         expires_at=expires_at,
         cleanup_task=task,
+        output_modes=output_modes,
     )
     _rescan_store[user_id] = entry
     return entry
@@ -185,6 +241,28 @@ def _peek_rescan(user_id: int) -> Optional[RescanEntry]:
     return entry
 
 
+def _domain_prompt_kb(
+    allow_skip: bool = False,
+) -> InlineKeyboardMarkup:
+    """Domain-prompt keyboard with an optional "Skip" button.
+
+    Used when the picked mode (ULP / Combo Full / CC) doesn't need a
+    target domain — lets the user tap once to bypass the prompt.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if allow_skip:
+        rows.append([
+            InlineKeyboardButton(
+                "\u23ed\ufe0f Skip (no filter)",
+                callback_data="extract_skip_domain",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def _cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel")]
@@ -199,10 +277,33 @@ def _cancel_job_kb(job_id: int) -> InlineKeyboardMarkup:
 
 # ── Entry: ask for domain ──────────────────────────────────
 async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Called via /extract command or the Extract button."""
+    """Called via /extract command or a main-menu Extract button.
+
+    The main menu now exposes one button per output mode plus a
+    multi-select "Mix Modes" entry. When the callback_data matches one
+    of the single-mode shortcuts (``extract_mode_*``) we remember that
+    as a preset so the rest of the flow skips the mode-picker step.
+    """
     user = update.effective_user
     if user is None:
         return ConversationHandler.END
+
+    # Detect single-mode shortcut. Multi-select entry uses ``extract``
+    # which leaves the preset empty and triggers the legacy picker. The
+    # same mode-specific entry points are also exposed as slash commands
+    # (``/cookies``, ``/ulp``, ``/combo``, ``/combo_full``, ``/cc``).
+    cb_data = (
+        update.callback_query.data if update.callback_query is not None else None
+    ) or ""
+    preset_mode = _SINGLE_MODE_MAP.get(cb_data)
+    if preset_mode is None and update.message and update.message.text:
+        head = update.message.text.strip().split()[0].lower()
+        head = head.split("@", 1)[0]  # strip /cmd@botname suffix
+        preset_mode = _SLASH_CMD_MODE_MAP.get(head)
+    if preset_mode:
+        context.user_data["extract_preset_mode"] = preset_mode  # type: ignore[index]
+    else:
+        context.user_data.pop("extract_preset_mode", None)  # type: ignore[union-attr]
 
     row = await db.ensure_user(user.id, user.username, user.first_name)
     if row["is_banned"]:
@@ -240,19 +341,63 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await update.message.reply_text(text)  # type: ignore[union-attr]
         return ConversationHandler.END
 
+    # Mode-specific intro + optional Skip button for domain-independent
+    # modes (ULP, Combo Full, CC — they scan the whole archive).
+    if preset_mode == COOKIE_MODE:
+        intro = (
+            "\U0001f36a <b>Cookies extraction</b>\n"
+            "Enter one or more domains to extract cookies for."
+        )
+    elif preset_mode == COMBO_TARGETED_MODE:
+        intro = (
+            "\U0001f3af <b>Combo (targeted)</b>\n"
+            "Enter the target domain(s) — I'll return "
+            "<code>user:pass</code> for those domains only."
+        )
+    elif preset_mode == ULP_MODE:
+        intro = (
+            "\U0001f511 <b>ULP extraction</b>\n"
+            "Tap <b>Skip</b> for every <code>url:user:pass</code> in the "
+            "logs, or enter domain(s) to filter only those hosts."
+        )
+    elif preset_mode == COMBO_FULL_MODE:
+        intro = (
+            "\U0001f4e6 <b>Combo (full)</b>\n"
+            "Tap <b>Skip</b> to get <code>user:pass</code> grouped by "
+            "host for every domain in the logs."
+        )
+    elif preset_mode == CC_MODE:
+        intro = (
+            "\U0001f4b3 <b>CC (Luhn)</b>\n"
+            "Tap <b>Skip</b> to extract every Luhn-valid card from the "
+            "logs. Entering domains is optional and only affects the "
+            "output filename."
+        )
+    else:
+        intro = (
+            "\U0001f9e9 <b>Mix Modes</b>\n"
+            "Enter one or more domains — you'll pick output formats "
+            "next."
+        )
     text = (
-        "\U0001f310 Enter one or more domains to extract cookies for.\n"
-        f"Up to {config.MAX_DOMAINS_PER_EXTRACT} domains, separated by commas, "
-        "spaces or new lines.\n\n"
+        f"{intro}\n"
+        f"Up to {config.MAX_DOMAINS_PER_EXTRACT} domains, separated by "
+        f"commas, spaces or new lines.\n\n"
         "Examples:\n"
         "  spotify.com\n"
         "  spotify.com, netflix.com, crunchyroll.com"
     )
+    allow_skip = preset_mode in _DOMAIN_INDEPENDENT_MODES
+    kb = _domain_prompt_kb(allow_skip=allow_skip)
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=_cancel_kb())
+        await update.callback_query.edit_message_text(
+            text, reply_markup=kb, parse_mode="HTML",
+        )
     else:
-        await update.message.reply_text(text, reply_markup=_cancel_kb())  # type: ignore[union-attr]
+        await update.message.reply_text(  # type: ignore[union-attr]
+            text, reply_markup=kb, parse_mode="HTML",
+        )
     return DOMAIN
 
 
@@ -303,9 +448,82 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _kickoff_rescan_job(update, context, entry, domains)
         return ConversationHandler.END
 
-    is_admin = user.id == config.ADMIN_ID
-    remaining = await db.get_remaining_quota(user.id)
-    vip = await db.is_vip(user.id)
+    # Single-mode shortcut: user came in via one of the main-menu mode
+    # buttons. Pre-set the selected modes and jump straight to FILE.
+    preset_mode: Optional[str] = context.user_data.get(  # type: ignore[union-attr]
+        "extract_preset_mode",
+    )
+    if preset_mode:
+        context.user_data["extract_modes"] = {preset_mode}  # type: ignore[index]
+        prompt = await _build_file_prompt(user.id, domains, {preset_mode})
+        await update.message.reply_text(
+            prompt, reply_markup=_cancel_kb(),
+        )
+        return FILE
+
+    # Initialise the mode-selection state with sane defaults: cookies
+    # only (the legacy behavior) so the user can just hit "Done" if they
+    # only care about cookie extraction.
+    context.user_data["extract_modes"] = {COOKIE_MODE}  # type: ignore[index]
+
+    await update.message.reply_text(
+        _mode_picker_text(domains),
+        reply_markup=_mode_picker_kb(context.user_data["extract_modes"], domains),  # type: ignore[union-attr]
+        parse_mode="HTML",
+    )
+    return MODE
+
+
+async def domain_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped 'Skip' on the domain prompt (domain-independent mode).
+
+    Only valid when the conversation was started via one of the single-
+    mode shortcuts that don't need a target domain (ULP, Combo Full, CC).
+    Falls back to a placeholder domain used only for the output filename.
+    """
+    q = update.callback_query
+    user = update.effective_user
+    if q is None or user is None:
+        return DOMAIN
+    await q.answer()
+
+    preset_mode: Optional[str] = context.user_data.get(  # type: ignore[union-attr]
+        "extract_preset_mode",
+    )
+    if preset_mode not in _DOMAIN_INDEPENDENT_MODES:
+        try:
+            await q.answer(
+                "This mode needs a target domain.", show_alert=True,
+            )
+        except Exception:
+            pass
+        return DOMAIN
+
+    domains = [_DEFAULT_PLACEHOLDER_DOMAIN]
+    context.user_data["extract_domains"] = domains  # type: ignore[index]
+    context.user_data["extract_domain"] = domains[0]  # type: ignore[index]
+    context.user_data["extract_modes"] = {preset_mode}  # type: ignore[index]
+
+    prompt = await _build_file_prompt(user.id, domains, {preset_mode})
+    try:
+        await q.edit_message_text(prompt, reply_markup=_cancel_kb())
+    except Exception:
+        if update.effective_chat is not None:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=prompt,
+                reply_markup=_cancel_kb(),
+            )
+    return FILE
+
+
+async def _build_file_prompt(
+    user_id: int, domains: List[str], modes: "set[str]",
+) -> str:
+    """Render the 'now send your archive' message for any flow."""
+    is_admin = user_id == config.ADMIN_ID
+    remaining = await db.get_remaining_quota(user_id)
+    vip = await db.is_vip(user_id)
     if is_admin or vip:
         limit_text = "Unlimited"
     else:
@@ -317,7 +535,9 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         max_file = "2 GB"
 
-    if len(domains) == 1:
+    if domains and domains[0] == _DEFAULT_PLACEHOLDER_DOMAIN:
+        domain_line = "\U0001f310 Scope: full archive (no domain filter)"
+    elif len(domains) == 1:
         domain_line = f"\U0001f310 Domain: {domains[0]}"
     else:
         domain_line = (
@@ -325,15 +545,131 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             + ", ".join(domains)
         )
 
-    text = (
+    mode_label = ", ".join(
+        f"{emoji} {label}"
+        for mid, label, emoji in _MODE_BUTTONS
+        if mid in modes
+    )
+
+    return (
         f"{domain_line}\n"
-        f"\U0001f4c1 Now send your archive file — OR paste a direct "
-        f"download URL (.zip / .rar).\n"
-        f"Supported: .zip .rar .7z .tar.gz\n"
+        f"\u2699\ufe0f Output: {mode_label}\n"
+        f"\U0001f4c1 Now send your archive file \u2014 OR paste a direct "
+        f"download URL (mega.nz, mediafire, gofile, upload.ee, "
+        f"pixeldrain, krakenfiles, bunkr, dropmefiles, qiwi.gg, "
+        f"send.cm, swisstransfer, zippyshare).\n"
+        f"Supported uploads:\n"
+        f"\u2022 Archives: .zip .rar .7z .tar.gz .tar.bz2 .tar.xz .tar.zst "
+        f".zst .cab .iso .arj .deb .rpm .dmg \u2026\n"
+        f"\u2022 Plain logs: .txt .log .csv .json .xml .html .yaml \u2026\n"
+        f"\u2022 Split parts: .001 .002 \u2026 .r01 .z01 .part1.rar\n"
         f"Your limit: {limit_text} remaining today\n"
         f"Max file size: {max_file}"
     )
-    await update.message.reply_text(text, reply_markup=_cancel_kb())
+
+
+# ── State: MODE ────────────────────────────────────────────
+def _mode_picker_text(domains: List[str]) -> str:
+    domain_label = (
+        domains[0] if len(domains) == 1
+        else f"{len(domains)} domains"
+    )
+    return (
+        f"\u2699\ufe0f <b>Output format</b>\n"
+        f"\U0001f310 Target: <code>{domain_label}</code>\n\n"
+        f"Pick one or more formats. Toggle each on/off, then tap "
+        f"<b>Done</b>. You can mix cookies with credential exports — "
+        f"the archive is only scanned once.\n\n"
+        f"\u2022 <b>Cookies</b> \u2014 Netscape <code>.txt</code> per "
+        f"target domain (legacy)\n"
+        f"\u2022 <b>ULP</b> \u2014 every <code>url:user:pass</code> in "
+        f"the logs, deduped\n"
+        f"\u2022 <b>Combo (targeted)</b> \u2014 <code>user:pass</code> "
+        f"for the target domain(s) only\n"
+        f"\u2022 <b>Combo (full)</b> \u2014 <code>user:pass</code> "
+        f"grouped by host, every domain in the logs"
+    )
+
+
+def _mode_picker_kb(
+    selected: "set[str]",
+    domains: List[str],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for mode_id, label, emoji in _MODE_BUTTONS:
+        mark = "\u2705" if mode_id in selected else "\u2b1c"
+        rows.append([
+            InlineKeyboardButton(
+                f"{mark} {emoji} {label}",
+                callback_data=f"mode_toggle:{mode_id}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            "\u2705 Done \u2192 send archive", callback_data="mode_done",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton("\u274c Cancel", callback_data="extract_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def mode_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Flip one output-mode checkbox on or off."""
+    q = update.callback_query
+    if q is None or q.data is None:
+        return MODE
+    await q.answer()
+    mode_id = q.data.split(":", 1)[1] if ":" in q.data else ""
+    if mode_id not in {m for m, _, _ in _MODE_BUTTONS}:
+        return MODE
+    selected: set = context.user_data.get("extract_modes") or {COOKIE_MODE}  # type: ignore[union-attr,assignment]
+    if mode_id in selected:
+        selected.discard(mode_id)
+    else:
+        selected.add(mode_id)
+    context.user_data["extract_modes"] = selected  # type: ignore[index]
+    domains: list[str] = context.user_data.get("extract_domains", [])  # type: ignore[union-attr]
+    try:
+        await q.edit_message_reply_markup(
+            reply_markup=_mode_picker_kb(selected, domains),
+        )
+    except Exception:
+        pass
+    return MODE
+
+
+async def mode_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User finished picking output modes — move on to the FILE state."""
+    q = update.callback_query
+    user = update.effective_user
+    if q is None or user is None:
+        return MODE
+    await q.answer()
+
+    selected: set = context.user_data.get("extract_modes") or set()  # type: ignore[union-attr,assignment]
+    if not selected:
+        try:
+            await q.answer(
+                "Pick at least one format first.", show_alert=True,
+            )
+        except Exception:
+            pass
+        return MODE
+
+    domains: list[str] = context.user_data.get("extract_domains", [])  # type: ignore[union-attr]
+    text = await _build_file_prompt(user.id, domains, selected)
+    try:
+        await q.edit_message_text(text, reply_markup=_cancel_kb())
+    except Exception:
+        # Fallback to a new message if the inline edit failed (rare).
+        if update.effective_chat is not None:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=text,
+                reply_markup=_cancel_kb(),
+            )
     return FILE
 
 
@@ -408,11 +744,19 @@ async def _kickoff_rescan_job(
     progress = ExtractionProgress()
     _active_progress[job_id] = progress
 
+    # Rescan reuses whatever output modes the user picked on the
+    # ORIGINAL extraction. Falls back to cookies-only for older rescan
+    # entries that pre-date this field.
+    modes = frozenset(
+        getattr(entry, "output_modes", None) or {COOKIE_MODE},
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             ("rescan", entry.archive_path, entry.file_name),
             progress_msg, progress,
+            output_modes=modes,
         )
 
     item = QueueItem(
@@ -516,10 +860,15 @@ async def file_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     source_ref = update.message  # Telegram document source
 
+    modes = frozenset(
+        context.user_data.get("extract_modes") or {COOKIE_MODE},  # type: ignore[union-attr]
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             source_ref, progress_msg, progress,
+            output_modes=modes,
         )
 
     # Enqueue with three-tier priority (admin > VIP > free).
@@ -560,16 +909,20 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not _URL_RE.match(raw):
         await update.message.reply_text(
             "\u274c That doesn't look like a direct URL.\n"
-            "Send an archive file or paste an http(s) link to a .zip/.rar.",
+            "Send an archive (.zip / .rar / .7z / .tar.* / \u2026) or a "
+            "plain log (.txt / .log / .csv / \u2026) URL.",
             reply_markup=_cancel_kb(),
         )
         return FILE
 
     # Basic extension sanity check (HEAD probe is done by the worker).
+    # The validator already knows the full whitelist (archives, plain
+    # logs, multi-volume parts) so just defer to it.
     lower = raw.split("?", 1)[0].lower()
-    if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar.gz", ".tgz")):
+    ok, _ = validate_archive(lower, None)
+    if not ok:
         # Not fatal — CDN redirects often have no extension. Just warn.
-        logger.info("URL has no archive extension, trusting server: {}", raw)
+        logger.info("URL has no recognised extension, trusting server: {}", raw)
 
     is_admin = user.id == config.ADMIN_ID
     vip = await db.is_vip(user.id)
@@ -594,10 +947,15 @@ async def url_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     progress = ExtractionProgress()
     _active_progress[job_id] = progress
 
+    modes = frozenset(
+        context.user_data.get("extract_modes") or {COOKIE_MODE},  # type: ignore[union-attr]
+    )
+
     async def _worker() -> None:
         await _process_job(
             update, context, job_id, user.id, domains,
             ("url", raw, file_name), progress_msg, progress,
+            output_modes=modes,
         )
 
     item = QueueItem(
@@ -628,6 +986,7 @@ async def _process_job(
     original_msg,
     progress_msg,
     progress: ExtractionProgress,
+    output_modes: frozenset = frozenset({COOKIE_MODE}),
 ) -> None:
     """Download, extract, send results — runs inside the queue worker."""
     start_ts = time.monotonic()
@@ -713,10 +1072,11 @@ async def _process_job(
             )
             return
 
-        # Extract — run_extraction_async accepts a single domain string
-        # or a list of domains for multi-target jobs.
+        # Extract — pass the user-selected output modes so the same
+        # archive can produce cookies + ULP + combo files in one pass.
         result = await run_extraction_async(
             archive_path, domains, progress, password=password,
+            output_modes=output_modes,
         )
 
         if not updater_task.done():
@@ -744,7 +1104,10 @@ async def _process_job(
                      InlineKeyboardButton("\U0001f3e0 Home", callback_data="home")],
                 ]),
             )
-            if not result.partial:
+            # Only ping the admin for code-bug-shaped failures. Bad
+            # archives, non-UTF8 filenames, disk-full, wrong passwords, …
+            # all set ``recoverable=True`` and don't need a critical alert.
+            if not result.partial and not getattr(result, "recoverable", False):
                 _notify_admin_error(context, user_id, "extraction", result.error)
             return
 
@@ -816,6 +1179,7 @@ async def _process_job(
                                 cached_size,
                                 float(config.RESCAN_WINDOW_SECONDS),
                                 password=cached_pw,
+                                output_modes=output_modes,
                             )
                             rescan_armed = True
                 elif os.path.exists(archive_path):
@@ -834,6 +1198,7 @@ async def _process_job(
                             os.path.getsize(target_path),
                             float(config.RESCAN_WINDOW_SECONDS),
                             password=password,
+                            output_modes=output_modes,
                         )
                         rescan_armed = True
                     else:
@@ -865,7 +1230,33 @@ async def _process_job(
         summary = (
             f"{header}\n\n"
             f"{domain_lines}"
-            f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
+        )
+        if COOKIE_MODE in output_modes:
+            summary += (
+                f"\U0001f36a Cookies found: {result.cookies_found:,}\n"
+            )
+        # Per-credential-mode totals (only show what was requested).
+        cred_counts = getattr(result, "credential_counts", {}) or {}
+        if ULP_MODE in output_modes:
+            summary += (
+                f"\U0001f4dd ULP lines: {cred_counts.get(ULP_MODE, 0):,}\n"
+            )
+        if COMBO_TARGETED_MODE in output_modes:
+            summary += (
+                f"\U0001f3af Combo (targeted): "
+                f"{cred_counts.get(COMBO_TARGETED_MODE, 0):,}\n"
+            )
+        if COMBO_FULL_MODE in output_modes:
+            summary += (
+                f"\U0001f4e6 Combo (full): "
+                f"{cred_counts.get(COMBO_FULL_MODE, 0):,}\n"
+            )
+        if CC_MODE in output_modes:
+            summary += (
+                f"\U0001f4b3 CC (Luhn-valid): "
+                f"{cred_counts.get(CC_MODE, 0):,}\n"
+            )
+        summary += (
             f"\U0001f4c1 Files scanned: {result.files_scanned:,}\n"
             f"\U0001f4e6 Archive size: {bytes_human(file_size)}\n"
             f"\u23f1 Time taken: {seconds_human(duration)}\n"
@@ -1562,12 +1953,33 @@ def register(app, job_queue: JobQueue) -> None:
         entry_points=[
             CallbackQueryHandler(extract_entry, pattern="^extract$"),
             CommandHandler("extract", extract_entry),
+            # Single-mode shortcut buttons on the main menu \u2014 each
+            # bypasses the mode-picker by pre-selecting one output mode.
+            CallbackQueryHandler(
+                extract_entry, pattern=_SINGLE_MODE_CB_PATTERN,
+            ),
+            # Convenience slash commands for the same five modes so the
+            # user can type ``/cookies``, ``/ulp``, ``/cc``, etc. instead
+            # of going through the menu.
+            CommandHandler("cookies", extract_entry),
+            CommandHandler("ulp", extract_entry),
+            CommandHandler("combo", extract_entry),
+            CommandHandler("combo_full", extract_entry),
+            CommandHandler("cc", extract_entry),
             # 'Search more domains' button after a successful extraction.
             CallbackQueryHandler(rescan_entry, pattern="^rescan_more$"),
         ],
         states={
             DOMAIN: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, domain_received),
+                CallbackQueryHandler(
+                    domain_skip, pattern="^extract_skip_domain$",
+                ),
+                CallbackQueryHandler(cancel_extract, pattern="^extract_cancel$"),
+            ],
+            MODE: [
+                CallbackQueryHandler(mode_toggle, pattern=r"^mode_toggle:"),
+                CallbackQueryHandler(mode_done, pattern=r"^mode_done$"),
                 CallbackQueryHandler(cancel_extract, pattern="^extract_cancel$"),
             ],
             FILE: [

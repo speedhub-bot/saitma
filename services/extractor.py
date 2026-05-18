@@ -21,15 +21,34 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Union
+from typing import (
+    Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Union,
+)
 
 from loguru import logger
 
 import config
+from services import log_parser
 
 MAX_TEXT_SCAN_BYTES = 64 * 1024 * 1024
 PROCESS_TAIL_BYTES = 8192
 ARCHIVE_PROCESS_IDLE_SECONDS = 900.0
+
+# Output mode tokens for ``run_extraction_async``. Kept up top so the
+# zip-streaming fast path (defined before _run_extraction) can use the
+# defaults too.
+COOKIE_MODE = "cookies"
+ULP_MODE = "ulp"
+COMBO_TARGETED_MODE = "combo_targeted"
+COMBO_FULL_MODE = "combo_full"
+CC_MODE = "cc"
+ALL_CREDENTIAL_MODES: "FrozenSet[str]" = frozenset(
+    {ULP_MODE, COMBO_TARGETED_MODE, COMBO_FULL_MODE}
+)
+ALL_NON_COOKIE_MODES: "FrozenSet[str]" = frozenset(
+    {ULP_MODE, COMBO_TARGETED_MODE, COMBO_FULL_MODE, CC_MODE}
+)
+DEFAULT_OUTPUT_MODES: "FrozenSet[str]" = frozenset({COOKIE_MODE})
 
 
 # ════════════════════════════════════════════════════════════
@@ -265,6 +284,7 @@ class ExtractionProgress:
     files_total: int = 0
     files_scanned: int = 0
     cookies_found: int = 0
+    credentials_found: int = 0   # ULP / combo password rows produced
     download_current: int = 0
     download_total: int = 0
     download_start: float = 0.0     # monotonic timestamp when download began
@@ -300,6 +320,68 @@ class ExtractionResult:
     # was configured for one or more domains; keys are the cleaned target
     # domain strings.
     per_domain_counts: Dict[str, int] = field(default_factory=dict)
+    # Credential-mode counters (ULP / combo). Zero when those modes
+    # weren't requested.
+    credentials_found: int = 0
+    # Per-output-mode counts so the user-facing summary can show
+    # ``2,431 ULP / 187 claude.ai combos``.
+    credential_counts: Dict[str, int] = field(default_factory=dict)
+    # True when ``error`` came from a known content/environment issue
+    # (corrupt archive, non-UTF8 filename, disk full, wrong password, …)
+    # rather than a code bug. Callers use this to decide whether to
+    # spam the admin with a critical-error alert.
+    recoverable: bool = False
+
+
+def _friendly_extraction_error(exc: BaseException) -> Tuple[str, bool]:
+    """Translate raw exceptions into user-facing messages.
+
+    Returns ``(message, recoverable)``. ``recoverable=True`` means the
+    failure is a known content/environment issue (bad archive, non-UTF8
+    filenames, disk full, wrong password, …) — *not* a code bug, so the
+    admin doesn't need to be paged.
+    """
+    if isinstance(exc, UnicodeDecodeError):
+        return (
+            "Archive contained non-UTF8 filenames or text. Most files were "
+            "still processed; some entries with garbled names were skipped.",
+            True,
+        )
+    if isinstance(exc, FileNotFoundError):
+        return (f"Required file missing: {exc}", True)
+    if isinstance(exc, PermissionError):
+        return (
+            "Permission denied while reading or writing extraction files.",
+            True,
+        )
+    if isinstance(exc, OSError):
+        # Disk full, ENOSPC, broken pipe, etc. — environment, not code.
+        errno_str = f" (errno {exc.errno})" if getattr(exc, "errno", None) else ""
+        return (f"OS error during extraction{errno_str}: {exc}", True)
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    recoverable_markers = (
+        "wrong password",
+        "bad password",
+        "is not encrypted",
+        "no files to extract",
+        "extraction failed",
+        "unrar exited with code",
+        "7z exited with code",
+        "rar: ",
+        "7z: ",
+        "patoolib: ",
+        "encrypted entries",
+        "crc",
+        "checksum",
+        "unsupported archive",
+        "not a zip",
+        "not a rar",
+        "corrupt",
+    )
+    if any(marker in low for marker in recoverable_markers):
+        return (msg, True)
+    return (msg, False)
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
@@ -421,7 +503,8 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
             try:
                 proc = subprocess.run(
                     [unrar, "lt", "-p-", archive_path],
-                    capture_output=True, text=True, timeout=60,
+                    capture_output=True, text=True, errors="replace",
+                    timeout=60,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
                 )
@@ -446,7 +529,8 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
         try:
             proc = subprocess.run(
                 [sz, "l", "-slt", archive_path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -682,29 +766,44 @@ def _is_split_archive(path: str) -> bool:
 
 
 # Magic-byte signatures used to detect the *actual* archive format,
-# regardless of the filename extension the user sent.
+# regardless of the filename extension the user sent. Order matters
+# only for prefix-collision avoidance (none here today).
 _MAGIC_SIGNATURES: List[tuple[bytes, str]] = [
-    (b"PK\x03\x04", "zip"),         # standard zip
-    (b"PK\x05\x06", "zip"),         # empty zip (EOCD only)
-    (b"PK\x07\x08", "zip"),         # spanned zip data descriptor
-    (b"Rar!\x1a\x07\x00", "rar"),   # RAR 1.5+
-    (b"Rar!\x1a\x07\x01\x00", "rar"),  # RAR 5.0
-    (b"7z\xbc\xaf\x27\x1c", "7z"),  # 7z
-    (b"\x1f\x8b", "gz"),            # gzip / .tar.gz
-    (b"BZh", "bz2"),                # bzip2 / .tar.bz2
-    (b"\xfd7zXZ\x00", "xz"),        # xz / .tar.xz
+    (b"PK\x03\x04", "zip"),                   # standard zip
+    (b"PK\x05\x06", "zip"),                   # empty zip (EOCD only)
+    (b"PK\x07\x08", "zip"),                   # spanned zip data descriptor
+    (b"Rar!\x1a\x07\x00", "rar"),             # RAR 1.5+
+    (b"Rar!\x1a\x07\x01\x00", "rar"),         # RAR 5.0
+    (b"7z\xbc\xaf\x27\x1c", "7z"),            # 7z
+    (b"\x1f\x8b", "gz"),                      # gzip / .tar.gz
+    (b"BZh", "bz2"),                          # bzip2 / .tar.bz2
+    (b"\xfd7zXZ\x00", "xz"),                  # xz / .tar.xz
+    (b"\x28\xb5\x2f\xfd", "zstd"),            # zstandard / .tar.zst
+    (b"\x04\x22\x4d\x18", "lz4"),             # lz4 frame
+    (b"LZIP", "lz"),                          # lzip
+    (b"\x5d\x00\x00", "lzma"),                # raw lzma (alone)
+    (b"MSCF", "cab"),                         # Microsoft Cabinet
+    (b"!<arch>\n", "ar"),                     # ar / .deb
+    (b"\xed\xab\xee\xdb", "rpm"),             # RPM
+    (b"\x60\xea", "arj"),                     # ARJ
+    (b"\x07\x07\x07", "cpio"),                # CPIO (binary)
+    (b"070701", "cpio"),                      # CPIO (newc ASCII)
+    (b"070702", "cpio"),                      # CPIO (crc ASCII)
+    (b"070707", "cpio"),                      # CPIO (odc ASCII)
 ]
 
 
 def _sniff_archive_type(path: str) -> Optional[str]:
     """Return a normalised archive-type tag based on file magic bytes.
 
-    Returns one of: "zip", "rar", "7z", "gz", "bz2", "xz", or None
-    if the file is empty / unreadable / unrecognised.
+    Returns one of: ``"zip"``, ``"rar"``, ``"7z"``, ``"gz"``, ``"bz2"``,
+    ``"xz"``, ``"zstd"``, ``"lz4"``, ``"lz"``, ``"lzma"``, ``"cab"``,
+    ``"ar"``, ``"rpm"``, ``"arj"``, ``"cpio"`` — or ``None`` if the file
+    is empty / unreadable / unrecognised.
     """
     try:
         with open(path, "rb") as f:
-            head = f.read(8)
+            head = f.read(16)
     except OSError:
         return None
     if not head:
@@ -713,6 +812,39 @@ def _sniff_archive_type(path: str) -> Optional[str]:
         if head.startswith(sig):
             return kind
     return None
+
+
+# Lowercased extensions for which we treat the upload as a single-file
+# "archive" — i.e. don't run any decompression, just copy the file into
+# the extraction dir and let the scanner walk it. Keep in sync with
+# :data:`utils.validators.SUPPORTED_TEXT_EXTENSIONS`.
+_PLAIN_TEXT_EXTENSIONS: tuple[str, ...] = (
+    ".txt", ".log", ".logs", ".csv", ".tsv",
+    ".json", ".jsonl", ".ndjson",
+    ".xml", ".html", ".htm",
+    ".yaml", ".yml", ".toml",
+    ".ini", ".conf", ".cfg",
+    ".md", ".markdown",
+    ".nfo", ".lst", ".list",
+    ".dat", ".out", ".dump", ".properties",
+)
+
+
+def _looks_like_plain_text(path: str) -> bool:
+    """Return True iff *path* is a plain-text upload we should scan in place.
+
+    A file qualifies when:
+      * its extension is in :data:`_PLAIN_TEXT_EXTENSIONS`, AND
+      * its magic bytes do **not** match any known archive format.
+
+    The magic-byte check stops a malicious / accidentally-wrong rename
+    (``passwords.rar`` saved as ``passwords.txt``) from skipping the
+    real extractor.
+    """
+    lower = path.lower()
+    if not any(lower.endswith(ext) for ext in _PLAIN_TEXT_EXTENSIONS):
+        return False
+    return _sniff_archive_type(path) is None
 
 
 class _DirCountPoller:
@@ -805,7 +937,8 @@ def _extract_with_7z(
         try:
             count_proc = subprocess.run(
                 list_cmd,
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -849,6 +982,8 @@ def _extract_with_7z(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )
@@ -989,7 +1124,8 @@ def _extract_with_unrar(
         try:
             count_proc = subprocess.run(
                 [unrar, "lb", pw_flag, archive_path],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace",
+                timeout=60,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -1015,6 +1151,8 @@ def _extract_with_unrar(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         start_new_session=True,
     )
@@ -1283,17 +1421,50 @@ def _extract_archive(
 
 
 def _ext_kind(lower_path: str) -> Optional[str]:
-    """Return the archive-kind tag implied by a (lowercased) filename."""
-    if lower_path.endswith(".zip"):
+    """Return the archive-kind tag implied by a (lowercased) filename.
+
+    Tags match those returned by :func:`_sniff_archive_type` so callers
+    can compare the on-disk magic-byte format with the filename hint.
+    """
+    if lower_path.endswith((".zip", ".zipx", ".jar", ".war",
+                            ".ear", ".apk", ".ipa", ".xpi")):
         return "zip"
-    if lower_path.endswith((".tar.gz", ".tgz")):
+    if lower_path.endswith((".tar.gz", ".tgz", ".gz")):
         return "gz"
-    if lower_path.endswith(".tar.bz2"):
+    if lower_path.endswith((".tar.bz2", ".tbz", ".tbz2", ".bz2")):
         return "bz2"
+    if lower_path.endswith((".tar.xz", ".txz", ".xz")):
+        return "xz"
+    if lower_path.endswith((".tar.zst", ".tzst", ".zst", ".zstd")):
+        return "zstd"
+    if lower_path.endswith((".tar.lz4", ".lz4")):
+        return "lz4"
+    if lower_path.endswith((".tar.lz", ".tlz", ".lz")):
+        return "lz"
+    if lower_path.endswith((".tar.lzma", ".lzma")):
+        return "lzma"
     if lower_path.endswith(".rar"):
         return "rar"
     if lower_path.endswith(".7z"):
         return "7z"
+    if lower_path.endswith(".cab"):
+        return "cab"
+    if lower_path.endswith(".iso"):
+        return "iso"
+    if lower_path.endswith(".arj"):
+        return "arj"
+    if lower_path.endswith(".ace"):
+        return "ace"
+    if lower_path.endswith(".cpio"):
+        return "cpio"
+    if lower_path.endswith((".ar", ".deb")):
+        return "ar"
+    if lower_path.endswith(".rpm"):
+        return "rpm"
+    if lower_path.endswith(".dmg"):
+        return "dmg"
+    if lower_path.endswith(".tar"):
+        return "tar"
     return None
 
 
@@ -1404,20 +1575,31 @@ def _run_extraction_zip_stream(
     progress: ExtractionProgress,
     output_dir: str,
     start: float,
+    output_modes: FrozenSet[str] = DEFAULT_OUTPUT_MODES,
 ) -> ExtractionResult:
     """Fast path for plain zip archives: walk members in place, scan
     each one in memory, write per-source .txt files (one folder per
     target domain) + bundle into one zip per domain.
 
+    When *output_modes* includes any credential mode (ULP / combo) we
+    also stream-parse every password file in the same loop and emit
+    the matching output files alongside the cookie zips.
+
     Saves the disk-space + wall-clock cost of first unpacking the whole
     archive to a temp dir, matching u.txt's ``extractZipStreaming`` idea.
     """
-    logger.info("Zip-streaming {} (no disk extraction)", archive_path)
+    logger.info(
+        "Zip-streaming {} (no disk extraction), modes={}",
+        archive_path, sorted(output_modes),
+    )
     progress.phase = "extracting"
     progress.extract_start = time.monotonic()
     progress.current_file = ""
 
     domains = _coerce_domains(domain)
+    want_cookies = COOKIE_MODE in output_modes
+    want_creds = bool(output_modes & ALL_CREDENTIAL_MODES)
+    want_cc = CC_MODE in output_modes
 
     per_source_dir = tempfile.mkdtemp(
         dir=str(config.TEMP_DIR), prefix="cookie_out_",
@@ -1434,6 +1616,9 @@ def _run_extraction_zip_stream(
 
     cookie_parser = SmartCookieExtractor(domains)
     per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+    creds: List[log_parser.Credential] = []
+    creds_seen: Set = set()
+    cc_by_num: Dict[str, "log_parser.CreditCard"] = {}
 
     try:
         try:
@@ -1463,20 +1648,63 @@ def _run_extraction_zip_stream(
                     progress.files_scanned += 1
                     continue
 
+                is_pwd = want_creds and log_parser.is_password_file(member.filename)
+                # CC scanning runs on both dedicated CC files and on
+                # password dumps — many stealers inline CC data right
+                # next to the passwords block. ``cc_strict`` is True
+                # for password files (require MM/YY/CVV near each hit)
+                # to drop the long tail of timestamp/order-ID false
+                # positives that pass Luhn coincidentally.
+                is_dedicated_cc = log_parser.is_cc_file(member.filename)
+                is_cc_candidate = want_cc and (
+                    is_dedicated_cc
+                    or log_parser.is_password_file(member.filename)
+                )
+                cc_strict = not is_dedicated_cc
+
+                # Read once, parse for cookies + credentials + CCs as
+                # requested. Tabbed cookie files have no ``@`` lines so
+                # the ULP parser will skip them naturally.
                 try:
                     with zf.open(member, "r") as fh:
-                        cookies = cookie_parser.extract_from_lines(
-                            line.decode("utf-8", errors="ignore")
-                            for line in fh
-                        )
+                        raw_bytes = fh.read()
                 except (RuntimeError, zipfile.BadZipFile, OSError):
-                    # RuntimeError from zipfile means encrypted entry —
-                    # we already probed and ruled that out, but just in
-                    # case skip silently instead of aborting the job.
                     progress.files_scanned += 1
                     continue
-                except Exception:
-                    cookies = []
+                text = raw_bytes.decode("utf-8", errors="ignore")
+
+                cookies: List[Dict[str, str]] = []
+                if want_cookies:
+                    try:
+                        cookies = cookie_parser.extract_from_lines(
+                            iter(text.splitlines())
+                        )
+                    except Exception:
+                        cookies = []
+
+                if is_pwd:
+                    for c in log_parser.parse_any(text):
+                        key = (c.url, c.user, c.password)
+                        if key in creds_seen:
+                            continue
+                        creds_seen.add(key)
+                        creds.append(c)
+
+                if is_cc_candidate:
+                    for card in log_parser.parse_credit_cards(text, strict=cc_strict):
+                        existing = cc_by_num.get(card.number)
+                        if existing is None:
+                            cc_by_num[card.number] = card
+                            continue
+                        # Prefer the record with more fields filled in.
+                        def _ccscore(c: "log_parser.CreditCard") -> int:
+                            return (
+                                int(bool(c.mm))
+                                + int(bool(c.yy))
+                                + int(bool(c.cvv))
+                            )
+                        if _ccscore(card) > _ccscore(existing):
+                            cc_by_num[card.number] = card
 
                 if cookies:
                     # Group hits from this source file by target domain so
@@ -1516,7 +1744,30 @@ def _run_extraction_zip_stream(
 
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+        output_files: List[str] = []
+        if want_cookies:
+            output_files.extend(
+                _bundle_all_zips(per_source_dir, output_dir, domains)
+            )
+
+        # Emit credential output files (ULP / combo) into output_dir
+        # alongside the cookie zips. These ride on the same job's
+        # delivery path so the user gets everything in one drop.
+        cred_counts: Dict[str, int] = {}
+        if want_creds:
+            output_files.extend(
+                _emit_credential_outputs(
+                    creds, domains, output_modes, output_dir, progress,
+                )
+            )
+            cred_counts = _credential_counts(creds, domains, output_modes)
+
+        if want_cc and cc_by_num:
+            cards = list(cc_by_num.values())
+            output_files.extend(
+                _emit_cc_outputs(cards, domains, output_dir, progress)
+            )
+            cred_counts[CC_MODE] = len(cards)
 
         output_files = [
             p for p in output_files
@@ -1533,8 +1784,10 @@ def _run_extraction_zip_stream(
                 files_scanned=progress.files_scanned,
                 duration_seconds=duration,
                 partial=True,
-                error="" if output_files else "Cancelled by user (no cookies found yet)",
+                error="" if output_files else "Cancelled by user (no results yet)",
                 per_domain_counts=per_domain_counts,
+                credentials_found=progress.credentials_found,
+                credential_counts=cred_counts,
             )
 
         progress.phase = "done"
@@ -1545,10 +1798,273 @@ def _run_extraction_zip_stream(
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
             per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
         )
 
     finally:
         shutil.rmtree(per_source_dir, ignore_errors=True)
+
+
+# ── Credential output (ULP / combo) ─────────────────────────
+
+
+def _safe_domain_label(domains: Iterable[str]) -> str:
+    """Filesystem-safe slug for the first domain (or ``multi`` for many)."""
+    domain_list = [d for d in domains if d]
+    if not domain_list:
+        return "logs"
+    if len(domain_list) == 1:
+        return re.sub(r"[^A-Za-z0-9._-]", "_", domain_list[0])
+    return "multi"
+
+
+def _collect_credentials_from_zip(
+    zf: "zipfile.ZipFile",
+    progress: ExtractionProgress,
+) -> List[log_parser.Credential]:
+    """Stream-scan a zip's password files in memory, no disk extraction.
+
+    Used by the streaming fast-path so credential modes don't force
+    a full disk extraction.
+    """
+    creds: List[log_parser.Credential] = []
+    seen: Set = set()
+    try:
+        members = list(zf.infolist())
+    except (UnicodeDecodeError, zipfile.BadZipFile, OSError) as exc:
+        logger.warning(
+            "zip infolist failed ({}); credentials skipped", exc,
+        )
+        return creds
+    for member in members:
+        if progress.cancelled:
+            break
+        try:
+            if member.is_dir():
+                continue
+            if not log_parser.is_password_file(member.filename):
+                continue
+            if member.file_size and member.file_size > MAX_TEXT_SCAN_BYTES:
+                continue
+        except (UnicodeDecodeError, AttributeError):
+            continue
+        try:
+            with zf.open(member, "r") as fh:
+                raw = fh.read()
+        except (RuntimeError, zipfile.BadZipFile, OSError, UnicodeDecodeError):
+            continue
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        for c in log_parser.parse_any(text):
+            key = (c.url, c.user, c.password)
+            if key in seen:
+                continue
+            seen.add(key)
+            creds.append(c)
+    return creds
+
+
+def _collect_credentials_from_dir(
+    root: str,
+    progress: ExtractionProgress,
+) -> List[log_parser.Credential]:
+    """Walk *root* and collect deduped credentials from every password file."""
+    creds: List[log_parser.Credential] = []
+    seen: Set = set()
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            if progress.cancelled:
+                return creds
+            fpath = os.path.join(dirpath, fname)
+            if not log_parser.is_password_file(fpath):
+                continue
+            try:
+                if os.path.getsize(fpath) > MAX_TEXT_SCAN_BYTES:
+                    continue
+                with open(fpath, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            for c in log_parser.parse_any(text):
+                key = (c.url, c.user, c.password)
+                if key in seen:
+                    continue
+                seen.add(key)
+                creds.append(c)
+    return creds
+
+
+def _emit_credential_outputs(
+    creds: List[log_parser.Credential],
+    domains: List[str],
+    output_modes: FrozenSet[str],
+    output_dir: str,
+    progress: ExtractionProgress,
+) -> List[str]:
+    """Write requested credential output files into *output_dir*.
+
+    Returns the list of files created (skipping empty ones). Bumps
+    ``progress.credentials_found`` to the total rows produced across
+    all enabled modes (deduped within each mode but not across modes —
+    a single ``user:pass`` may show up in both ULP and combo files).
+    """
+    out_files: List[str] = []
+    if not creds:
+        return out_files
+
+    slug = _safe_domain_label(domains)
+
+    if ULP_MODE in output_modes:
+        body = log_parser.format_ulp(creds)
+        if body.strip():
+            path = os.path.join(output_dir, f"{slug}_ulp.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                lines = body.count("\n")
+                progress.credentials_found += lines
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write ULP output {}", path)
+
+    if COMBO_TARGETED_MODE in output_modes and domains:
+        body = log_parser.format_combo_targeted(creds, domains)
+        if body.strip():
+            target_slug = re.sub(
+                r"[^A-Za-z0-9._-]", "_",
+                domains[0] if len(domains) == 1 else "targets",
+            )
+            path = os.path.join(
+                output_dir, f"{slug}_combo_targeted_{target_slug}.txt",
+            )
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                lines = body.count("\n")
+                progress.credentials_found += lines
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write combo-targeted output {}", path)
+
+    if COMBO_FULL_MODE in output_modes:
+        body = log_parser.format_combo_full(creds)
+        if body.strip():
+            path = os.path.join(output_dir, f"{slug}_combo_full.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+                # Section headers + blank lines aren't credentials; count
+                # only ``user:pass`` rows by re-running the formatter
+                # against the deduped cred set.
+                progress.credentials_found += len(set(c.combo_line for c in creds))
+                out_files.append(path)
+            except OSError:
+                logger.exception("Failed to write combo-full output {}", path)
+
+    return out_files
+
+
+def _credential_counts(
+    creds: List[log_parser.Credential],
+    domains: List[str],
+    output_modes: FrozenSet[str],
+) -> Dict[str, int]:
+    """Per-mode line-count summary used for the user-facing result text."""
+    counts: Dict[str, int] = {}
+    if not creds:
+        return counts
+    if ULP_MODE in output_modes:
+        counts[ULP_MODE] = len({c.ulp_line for c in creds})
+    if COMBO_TARGETED_MODE in output_modes and domains:
+        body = log_parser.format_combo_targeted(creds, domains)
+        counts[COMBO_TARGETED_MODE] = body.count("\n") if body.strip() else 0
+    if COMBO_FULL_MODE in output_modes:
+        counts[COMBO_FULL_MODE] = len({c.combo_line for c in creds})
+    return counts
+
+
+def _emit_cc_outputs(
+    cards: List["log_parser.CreditCard"],
+    domains: List[str],
+    output_dir: str,
+    progress: ExtractionProgress,
+) -> List[str]:
+    """Write the Luhn-validated CC file (``NUMBER|MM|YY|CVV`` per line).
+
+    Bumps ``progress.credentials_found`` by the number of cards written
+    so the live dashboard reflects CC results too.
+    """
+    out_files: List[str] = []
+    if not cards:
+        return out_files
+    body = log_parser.format_cc(cards)
+    if not body.strip():
+        return out_files
+    slug = _safe_domain_label(domains)
+    path = os.path.join(output_dir, f"{slug}_cc.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        progress.credentials_found += len(cards)
+        out_files.append(path)
+    except OSError:
+        logger.exception("Failed to write CC output {}", path)
+    return out_files
+
+
+def _collect_cc_from_dir(
+    root: str,
+    progress: ExtractionProgress,
+) -> List["log_parser.CreditCard"]:
+    """Walk *root* and collect deduped Luhn-valid CCs.
+
+    Scans password files + dedicated CC files (CreditCards.txt etc.).
+    """
+    by_num: Dict[str, "log_parser.CreditCard"] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for fname in files:
+            if progress.cancelled:
+                return list(by_num.values())
+            fpath = os.path.join(dirpath, fname)
+            if not (
+                log_parser.is_cc_file(fpath)
+                or log_parser.is_password_file(fpath)
+            ):
+                continue
+            try:
+                if os.path.getsize(fpath) > MAX_TEXT_SCAN_BYTES:
+                    continue
+                with open(fpath, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                continue
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            strict = not log_parser.is_cc_file(fpath)
+            for card in log_parser.parse_credit_cards(text, strict=strict):
+                existing = by_num.get(card.number)
+                if existing is None:
+                    by_num[card.number] = card
+                    continue
+
+                def _ccscore(c: "log_parser.CreditCard") -> int:
+                    return (
+                        int(bool(c.mm))
+                        + int(bool(c.yy))
+                        + int(bool(c.cvv))
+                    )
+                if _ccscore(card) > _ccscore(existing):
+                    by_num[card.number] = card
+    return list(by_num.values())
 
 
 def _run_extraction(
@@ -1556,6 +2072,7 @@ def _run_extraction(
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
+    output_modes: FrozenSet[str] = DEFAULT_OUTPUT_MODES,
 ) -> ExtractionResult:
     """Blocking extraction — meant to run inside ``asyncio.to_thread``.
 
@@ -1570,28 +2087,58 @@ def _run_extraction(
     temp_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
     output_dir = tempfile.mkdtemp(dir=str(config.TEMP_DIR))
 
+    # Initialise these at function scope so the catch-all ``except``
+    # below can still salvage anything that was already produced when
+    # a later phase blows up.
+    output_files: List[str] = []
+    per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
+    cred_counts: Dict[str, int] = {}
+
     try:
-        # Fast path: plain (non-encrypted) zip → stream-decompress each
+        # Fast path A: plain text / log upload → there's nothing to
+        # decompress, just symlink the file into the extraction dir
+        # and let the scanner walk it. Mirrors what we'd do for an
+        # archive that contained a single ``.txt`` member.
+        if _looks_like_plain_text(archive_path):
+            progress.phase = "extracting"
+            progress.extract_start = time.monotonic()
+            progress.extract_total = 1
+            base = os.path.basename(archive_path) or "upload.txt"
+            staged = os.path.join(temp_dir, base)
+            try:
+                os.symlink(archive_path, staged)
+            except OSError:
+                shutil.copy2(archive_path, staged)
+            progress.extract_current = 1
+            progress.current_file = base
+            logger.info(
+                "Plain-text upload detected ({}); skipping extraction",
+                archive_path,
+            )
+
+        # Fast path B: plain (non-encrypted) zip → stream-decompress each
         # entry in memory and scan as we go, avoiding a full disk
         # extraction. Mirrors u.txt's extractZipStreaming pattern.
-        if (
+        elif (
             password is None
             and _sniff_archive_type(archive_path) == "zip"
             and not _probe_encrypted_entries(archive_path)
         ):
             return _run_extraction_zip_stream(
                 archive_path, domains, progress, output_dir, start,
+                output_modes=output_modes,
             )
 
-        # Phase 1: extract archive
-        progress.phase = "extracting"
-        progress.extract_start = time.monotonic()
-        progress.current_file = ""
-        logger.info(
-            "Extracting archive {} into {} for domains={}",
-            archive_path, temp_dir, domains,
-        )
-        _extract_archive(archive_path, temp_dir, progress, password=password)
+        else:
+            # Phase 1: extract archive
+            progress.phase = "extracting"
+            progress.extract_start = time.monotonic()
+            progress.current_file = ""
+            logger.info(
+                "Extracting archive {} into {} for domains={}",
+                archive_path, temp_dir, domains,
+            )
+            _extract_archive(archive_path, temp_dir, progress, password=password)
 
         if progress.cancelled:
             # Nothing useful to send if the user cancelled mid-extraction.
@@ -1607,7 +2154,8 @@ def _run_extraction(
         # matching cookies, named ``akaza_{domain}_{counter}.txt`` and
         # then bundled into one zip per target domain.
         progress.phase = "scanning"
-        extractor = SmartCookieExtractor(domains)
+        want_cookies = COOKIE_MODE in output_modes
+        extractor = SmartCookieExtractor(domains) if want_cookies else None
 
         all_files: List[str] = []
         for root, _dirs, files in os.walk(temp_dir):
@@ -1622,7 +2170,6 @@ def _run_extraction(
             d: re.sub(r"[^A-Za-z0-9._-]", "_", d) for d in domains
         }
         file_counters: Dict[str, int] = {d: 1 for d in domains}
-        per_domain_counts: Dict[str, int] = {d: 0 for d in domains}
         for d in domains:
             os.makedirs(os.path.join(per_source_dir, d), exist_ok=True)
 
@@ -1635,6 +2182,11 @@ def _run_extraction(
                     progress.files_scanned += 1
                     continue
             except OSError:
+                progress.files_scanned += 1
+                continue
+            if not want_cookies:
+                # Skip cookie scanning entirely. Credentials are
+                # collected in the dedicated dir-walk below.
                 progress.files_scanned += 1
                 continue
             try:
@@ -1679,12 +2231,33 @@ def _run_extraction(
         # Phase 3: bundle per-source .txt files into one zip per domain.
         progress.phase = "packaging"
         progress.current_file = ""
-        output_files = _bundle_all_zips(per_source_dir, output_dir, domains)
+        if COOKIE_MODE in output_modes:
+            output_files.extend(
+                _bundle_all_zips(per_source_dir, output_dir, domains)
+            )
 
         # The per-source temp dir is no longer needed once zipped.
         shutil.rmtree(per_source_dir, ignore_errors=True)
 
-        # Drop empty zip files (shouldn't happen, but belt-and-braces).
+        # Optional phase 4: scan the same extracted tree for password
+        # files and emit ULP / combo outputs.
+        if output_modes & ALL_CREDENTIAL_MODES:
+            creds = _collect_credentials_from_dir(temp_dir, progress)
+            output_files.extend(
+                _emit_credential_outputs(
+                    creds, domains, output_modes, output_dir, progress,
+                )
+            )
+            cred_counts = _credential_counts(creds, domains, output_modes)
+
+        if CC_MODE in output_modes:
+            cards = _collect_cc_from_dir(temp_dir, progress)
+            output_files.extend(
+                _emit_cc_outputs(cards, domains, output_dir, progress)
+            )
+            cred_counts[CC_MODE] = len(cards)
+
+        # Drop empty output files (shouldn't happen, but belt-and-braces).
         output_files = [
             p for p in output_files
             if os.path.exists(p) and os.path.getsize(p) > 0
@@ -1701,8 +2274,10 @@ def _run_extraction(
                 files_scanned=progress.files_scanned,
                 duration_seconds=duration,
                 partial=True,
-                error="" if output_files else "Cancelled by user (no cookies found yet)",
+                error="" if output_files else "Cancelled by user (no results yet)",
                 per_domain_counts=per_domain_counts,
+                credentials_found=progress.credentials_found,
+                credential_counts=cred_counts,
             )
 
         progress.phase = "done"
@@ -1713,15 +2288,32 @@ def _run_extraction(
             files_scanned=progress.files_scanned,
             duration_seconds=duration,
             per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
         )
 
     except Exception as exc:
         logger.exception("Extraction failed")
         progress.phase = "failed"
+        friendly, recoverable = _friendly_extraction_error(exc)
+        # Salvage anything we produced before the failure so the user
+        # still gets partial output instead of a bare error message.
+        salvaged = [
+            p for p in output_files
+            if os.path.exists(p) and os.path.getsize(p) > 0
+        ]
         return ExtractionResult(
-            success=False,
-            error=str(exc),
+            success=bool(salvaged),
+            output_files=salvaged,
+            cookies_found=progress.cookies_found,
+            files_scanned=progress.files_scanned,
             duration_seconds=time.monotonic() - start,
+            partial=bool(salvaged),
+            error=friendly,
+            per_domain_counts=per_domain_counts,
+            credentials_found=progress.credentials_found,
+            credential_counts=cred_counts,
+            recoverable=recoverable,
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1733,15 +2325,23 @@ async def run_extraction_async(
     domain: Union[str, Iterable[str]],
     progress: ExtractionProgress,
     password: Optional[str] = None,
+    output_modes: Optional[Iterable[str]] = None,
 ) -> ExtractionResult:
     """Non-blocking facade — offloads heavy work to a thread.
 
     *domain* may be either a single domain string or an iterable of
     domain strings; in the multi-domain case each target gets its own
     output zip.
+
+    *output_modes* selects which outputs to produce. Defaults to
+    ``{COOKIE_MODE}`` (legacy behavior). Pass a set that includes any
+    of ``ULP_MODE``, ``COMBO_TARGETED_MODE``, ``COMBO_FULL_MODE`` to
+    also emit credential files. Cookies and credentials can be mixed
+    in one job; the same archive is scanned once for both.
     """
+    modes = frozenset(output_modes) if output_modes else DEFAULT_OUTPUT_MODES
     return await asyncio.to_thread(
-        _run_extraction, archive_path, domain, progress, password
+        _run_extraction, archive_path, domain, progress, password, modes,
     )
 
 

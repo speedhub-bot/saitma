@@ -34,9 +34,38 @@ BOT_CREDIT = "\U0001f338 Made with care \u2014 credits to @akaza_isnt"
 # ── Keyboards ─────────────────────────────────────────────
 def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("\U0001f50d Extract Cookies", callback_data="extract")],
+        # Row 1 — cookies + ULP
+        [
+            InlineKeyboardButton(
+                "\U0001f36a Cookies", callback_data="extract_mode_cookies",
+            ),
+            InlineKeyboardButton(
+                "\U0001f511 ULP", callback_data="extract_mode_ulp",
+            ),
+        ],
+        # Row 2 — combo targeted + full
+        [
+            InlineKeyboardButton(
+                "\U0001f3af Combo (Targeted)",
+                callback_data="extract_mode_combo_targeted",
+            ),
+            InlineKeyboardButton(
+                "\U0001f4e6 Combo (Full)",
+                callback_data="extract_mode_combo_full",
+            ),
+        ],
+        # Row 3 — CC + multi-mode
+        [
+            InlineKeyboardButton(
+                "\U0001f4b3 CC (Luhn)", callback_data="extract_mode_cc",
+            ),
+            InlineKeyboardButton(
+                "\U0001f9e9 Mix Modes", callback_data="extract",
+            ),
+        ],
+        # Row 4 — Loot (tdata / Discord / Steam / combos)
         [InlineKeyboardButton(
-            "\U0001f4e6 Loot (tdata / Discord / Steam / combos)",
+            "\U0001f4e6 Loot (tdata / Discord / Steam)",
             callback_data="loot",
         )],
         [
@@ -57,7 +86,7 @@ def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
 def _back_home_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("\U0001f50d Extract", callback_data="extract"),
+            InlineKeyboardButton("\U0001f9e9 Extract", callback_data="extract"),
             InlineKeyboardButton("\U0001f3e0 Home", callback_data="home"),
         ],
     ])
@@ -110,7 +139,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         vip_line = "\n\U0001f451 VIP (forever)"
 
     text = _welcome_text(user.first_name or "friend", quota_line, vip_line)
-    await update.message.reply_text(text, reply_markup=_main_menu_kb(user.id))  # type: ignore[union-attr]
+    await update.message.reply_text(  # type: ignore[union-attr]
+        text,
+        reply_markup=_main_menu_kb(user.id),
+        parse_mode="HTML",
+    )
 
 
 # ── Home callback ───────────────────────────────────────────
@@ -135,7 +168,11 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         vip_line = "\n\U0001f451 VIP (forever)"
 
     text = _welcome_text(user.first_name or "friend", quota_line, vip_line)
-    await query.edit_message_text(text, reply_markup=_main_menu_kb(user.id))
+    await query.edit_message_text(
+        text,
+        reply_markup=_main_menu_kb(user.id),
+        parse_mode="HTML",
+    )
 
 
 def _welcome_text(name: str, quota_line: str, vip_line: str) -> str:
@@ -145,9 +182,13 @@ def _welcome_text(name: str, quota_line: str, vip_line: str) -> str:
         f"{BOT_TAGLINE}\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001f44b Hey {name}!\n\n"
-        "Tap \U0001f50d Extract Cookies to get started \u2014 send one or more "
-        "domains, upload your archive, watch the live dashboard, and receive "
-        "your cookies as text files.\n\n"
+        "Pick what you want to extract:\n"
+        "  \U0001f36a <b>Cookies</b> — Netscape cookies per domain\n"
+        "  \U0001f511 <b>ULP</b> — every url:user:pass in the logs\n"
+        "  \U0001f3af <b>Combo (Targeted)</b> — user:pass for a domain\n"
+        "  \U0001f4e6 <b>Combo (Full)</b> — user:pass grouped by host\n"
+        "  \U0001f4b3 <b>CC (Luhn)</b> — credit cards from the logs\n"
+        "  \U0001f9e9 <b>Mix Modes</b> — pick any combination in one job\n\n"
         f"{quota_line}{vip_line}\n\n"
         f"{BOT_CREDIT}"
     )
@@ -251,22 +292,29 @@ HELP_PAGES = {
         "\u2753 Help — Page 1/3\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "\U0001f36a What does this bot do?\n"
-        "It extracts cookies for one or more domains from Netscape cookie "
-        "archive files you upload \u2014 a single scan of the archive can "
-        "produce a separate result file per domain.\n\n"
-        "Supported formats:\n"
-        "\u2022 .zip\n\u2022 .rar\n\u2022 .7z\n\u2022 .tar.gz / .tar.bz2"
+        "It scans your log archives and extracts whatever you ask for. "
+        "Pick one output mode from the main menu, or tap \U0001f9e9 "
+        "<b>Mix Modes</b> to combine several in a single scan.\n\n"
+        "Output modes:\n"
+        "\u2022 \U0001f36a <b>Cookies</b> \u2014 Netscape <code>.txt</code> per target domain\n"
+        "\u2022 \U0001f511 <b>ULP</b> \u2014 every <code>url:user:pass</code>, deduped\n"
+        "\u2022 \U0001f3af <b>Combo (Targeted)</b> \u2014 <code>user:pass</code> for a domain\n"
+        "\u2022 \U0001f4e6 <b>Combo (Full)</b> \u2014 <code>user:pass</code> grouped by host\n"
+        "\u2022 \U0001f4b3 <b>CC (Luhn)</b> \u2014 Luhn-valid credit cards\n\n"
+        "Supported archive formats: .zip .rar .7z .tar.gz / .tar.bz2"
     ),
     2: (
         "\u2753 Help — Page 2/3\n"
         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "How to use:\n"
-        "1\ufe0f\u20e3 Tap \U0001f50d Extract Cookies\n"
-        "2\ufe0f\u20e3 Enter one or more target domains (e.g. spotify.com or "
-        "spotify.com, netflix.com)\n"
-        "3\ufe0f\u20e3 Upload your archive file\n"
-        "4\ufe0f\u20e3 Wait for processing\n"
-        "5\ufe0f\u20e3 Receive your results!"
+        "1\ufe0f\u20e3 Tap a mode button on the main menu (or /cookies, /ulp, "
+        "/combo, /combo_full, /cc)\n"
+        "2\ufe0f\u20e3 Enter target domain(s) \u2014 or tap <b>Skip</b> for "
+        "ULP / Combo Full / CC to scan the whole archive\n"
+        "3\ufe0f\u20e3 Upload your archive file \u2014 OR paste a direct URL "
+        "(mediafire, gofile, mega.nz, pixeldrain, krakenfiles, bunkr, \u2026)\n"
+        "4\ufe0f\u20e3 Wait for processing on the live dashboard\n"
+        "5\ufe0f\u20e3 Receive your results as text files"
     ),
     3: (
         "\u2753 Help — Page 3/3\n"
@@ -292,6 +340,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(  # type: ignore[union-attr]
         HELP_PAGES[1],
         reply_markup=InlineKeyboardMarkup(_help_kb(1)),
+        parse_mode="HTML",
     )
 
 
@@ -313,6 +362,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.edit_message_text(
         HELP_PAGES[page],
         reply_markup=InlineKeyboardMarkup(_help_kb(page)),
+        parse_mode="HTML",
     )
 
 

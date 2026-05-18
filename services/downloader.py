@@ -18,6 +18,7 @@ import os
 import re
 import time
 import urllib.parse
+from typing import Optional
 
 from loguru import logger
 from pyrogram import Client, raw
@@ -652,6 +653,33 @@ def _filename_from_headers(url: str, content_disposition: str) -> str:
     return tail or "archive"
 
 
+def _force_archive_extension(file_name: str) -> str:
+    """Append ``.zip`` when *file_name* has no extension at all.
+
+    Keeps the rest of the extractor pipeline's extension-sniffing
+    happy. The magic-byte sniffer in extractor.py is the final word on
+    format — this is just a hint. Recognises every archive / plain-log
+    / split-part shape the validator accepts so a downloaded
+    ``logs.txt`` or ``backup.7z.001`` isn't renamed to ``...zip``.
+    """
+    # Local import to avoid circular module load with utils → services.
+    from utils.validators import (  # noqa: WPS433 (intentional local import)
+        SUPPORTED_EXTENSIONS,
+        is_split_archive_part,
+    )
+
+    if not file_name:
+        return "archive.zip"
+    lower = file_name.lower()
+    if any(lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
+        return file_name
+    if is_split_archive_part(lower):
+        return file_name
+    if "." not in file_name:
+        return file_name + ".zip"
+    return file_name
+
+
 async def download_from_url(
     url: str,
     dest_path: str,
@@ -661,8 +689,16 @@ async def download_from_url(
     timeout: float = 60.0,
     status_msg=None,
     cancel_kb=None,
+    host_password: "Optional[str]" = None,
 ) -> str:
     """Stream-download *url* into *dest_path* using aiohttp.
+
+    For known "indirect" hosts (gofile, mediafire, mega.nz, pixeldrain,
+    upload.ee, krakenfiles, bunkr, swisstransfer, dropmefiles, qiwi.gg,
+    send.cm, zippyshare-clones) the URL is first resolved to a direct
+    CDN link via the matching adapter in
+    :mod:`services.url_downloaders`. *host_password* is forwarded to
+    the adapter (used by gofile / swisstransfer share-level passwords).
 
     The Content-Disposition header is honoured for the final filename.
     Updates ``progress.download_current`` / ``download_total`` so the
@@ -680,6 +716,8 @@ async def download_from_url(
             "`pip install aiohttp` and retry."
         ) from exc
 
+    from services import url_downloaders as _hosts
+
     progress.phase = "downloading"
     progress.download_current = 0
     progress.download_total = 0
@@ -692,7 +730,93 @@ async def download_from_url(
     async with aiohttp.ClientSession(
         timeout=timeout_cfg, headers=_URL_HEADERS,
     ) as session:
-        async with session.get(url, allow_redirects=True) as resp:
+        # Step 1: try a host adapter for known indirect hosts.
+        resolved = await _hosts.resolve(session, url, host_password)
+
+        if isinstance(resolved, _hosts.StreamingDownload):
+            # Host-managed download (e.g. mega.nz needs on-the-fly
+            # decryption). The adapter hands us an async iterator that
+            # yields ``(chunk_bytes, total_or_None)``.
+            file_name = _force_archive_extension(
+                file_name_hint or resolved.file_name or "download.bin"
+            )
+            total = resolved.total_size or 0
+            progress.download_total = total
+            if total:
+                required_bytes = int(
+                    total * config.EXTRACTION_DISK_MULTIPLIER
+                    + config.MIN_FREE_DISK_BYTES
+                )
+                ensure_enough_disk_space(dest_path, required_bytes)
+
+            out_path = os.path.join(dest_path, file_name)
+            start_ts = time.monotonic()
+            last_log = start_ts
+            last_edit_bytes = 0
+            last_edit_ts = 0.0
+            downloaded = 0
+            stream = await resolved.factory()
+            with open(out_path, "wb") as fh:
+                async for chunk, maybe_total in stream:
+                    if progress.cancelled:
+                        raise RuntimeError("Download cancelled by user")
+                    if maybe_total and not progress.download_total:
+                        progress.download_total = maybe_total
+                        total = maybe_total
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    progress.download_current = downloaded
+                    now = time.monotonic()
+                    if now - last_log >= MIN_EDIT_INTERVAL:
+                        elapsed = max(now - start_ts, 0.001)
+                        speed = downloaded / elapsed / 1e6
+                        logger.debug(
+                            "Host-stream download {}/{} ({:.1f} MB/s)",
+                            downloaded, total or "?", speed,
+                        )
+                        last_log = now
+                    if (
+                        status_msg is not None
+                        and (downloaded - last_edit_bytes) >= LIVE_MSG_EDIT_BYTES
+                        and (now - last_edit_ts) >= LIVE_MSG_EDIT_INTERVAL
+                    ):
+                        last_edit_bytes = downloaded
+                        last_edit_ts = now
+                        await _edit_live_progress(
+                            status_msg, downloaded,
+                            total or downloaded, start_ts, cancel_kb,
+                        )
+            elapsed = time.monotonic() - start_ts
+            progress.download_total = downloaded
+            progress.download_current = downloaded
+            progress.live_download_msg = False
+            logger.info(
+                "Host-stream download complete: {} ({:.1f} MB in {:.1f}s)",
+                out_path, downloaded / 1e6, elapsed,
+            )
+            return out_path
+
+        # If we got a ResolvedURL, swap the URL and merge headers /
+        # cookies / referer before opening the real GET.
+        get_headers: dict[str, str] = {}
+        get_cookies: dict[str, str] = {}
+        forced_name: "Optional[str]" = None
+        if isinstance(resolved, _hosts.ResolvedURL):
+            url = resolved.url
+            forced_name = resolved.file_name
+            if resolved.headers:
+                get_headers.update(resolved.headers)
+            if resolved.referer:
+                get_headers.setdefault("Referer", resolved.referer)
+            if resolved.cookies:
+                get_cookies.update(resolved.cookies)
+
+        async with session.get(
+            url,
+            allow_redirects=True,
+            headers=get_headers or None,
+            cookies=get_cookies or None,
+        ) as resp:
             if resp.status >= 400:
                 raise RuntimeError(
                     f"HTTP {resp.status} — server rejected the request. "
@@ -706,16 +830,12 @@ async def download_from_url(
             )
             ensure_enough_disk_space(dest_path, required_bytes)
             cd = resp.headers.get("Content-Disposition", "") or ""
-            file_name = file_name_hint or _filename_from_headers(url, cd)
-            if not any(file_name.lower().endswith(ext) for ext in (
-                ".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar",
-            )):
-                # Force an extension so the rest of the pipeline's
-                # filename-extension sniffing doesn't misclassify. The
-                # magic-byte sniffer in extractor.py is the final word
-                # on format.
-                if file_name and "." not in file_name:
-                    file_name = file_name + ".zip"
+            file_name = (
+                file_name_hint
+                or forced_name
+                or _filename_from_headers(url, cd)
+            )
+            file_name = _force_archive_extension(file_name)
 
             out_path = os.path.join(dest_path, file_name)
             start_ts = time.monotonic()
