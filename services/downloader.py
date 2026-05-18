@@ -893,3 +893,104 @@ async def download_from_url(
         out_path, mb, elapsed, speed,
     )
     return out_path
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Upload helper — Bot API for small files, Pyrogram MTProto for big
+# ════════════════════════════════════════════════════════════════════
+
+# The HTTP Bot API rejects documents larger than 50 MB. Pyrogram's
+# MTProto transport handles up to 2 GB.
+_BOT_API_FILE_LIMIT = 50 * 1024 * 1024  # 50 MB
+
+
+async def send_result_file(
+    context,
+    chat_id: int,
+    file_path: str,
+    *,
+    caption: str | None = None,
+    status_msg=None,
+) -> bool:
+    """Upload *file_path* to *chat_id*. Returns ``True`` on success.
+
+    * Files ≤ 50 MB are sent via the standard Bot API (fast, no extra
+      dependencies).
+    * Files > 50 MB are sent via the Pyrogram MTProto client which
+      supports uploads up to 2 GB.
+    * If *status_msg* is provided, it is periodically edited with an
+      upload progress indicator so the user doesn't think the bot is
+      stuck.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return False
+
+    file_size = os.path.getsize(file_path)
+    filename = os.path.basename(file_path)
+
+    if file_size <= _BOT_API_FILE_LIMIT:
+        try:
+            with open(file_path, "rb") as fh:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=fh,
+                    filename=filename,
+                    caption=caption,
+                    read_timeout=300,
+                    write_timeout=300,
+                    connect_timeout=30,
+                )
+            return True
+        except Exception:
+            logger.exception(
+                "Bot API upload failed for {} ({:.1f} MB), trying Pyrogram",
+                filename, file_size / 1024 / 1024,
+            )
+
+    # Large file → Pyrogram MTProto upload
+    try:
+        client = await _get_pyrogram()
+        _last_edit = {"ts": 0.0}
+
+        async def _upload_progress(current: int, total: int) -> None:
+            now = time.monotonic()
+            if now - _last_edit["ts"] < 3.0:
+                return
+            _last_edit["ts"] = now
+            pct = current / max(total, 1) * 100
+            mb_done = current / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            text = (
+                f"\U0001f4e4 Uploading {filename}\n"
+                f"   {mb_done:.1f} / {mb_total:.1f} MB ({pct:.0f}%)"
+            )
+            if status_msg:
+                try:
+                    await status_msg.edit_text(text)
+                except Exception:
+                    pass
+
+        await client.send_document(
+            chat_id=chat_id,
+            document=file_path,
+            caption=caption,
+            file_name=filename,
+            progress=_upload_progress,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Pyrogram upload also failed for {} ({:.1f} MB)",
+            filename, file_size / 1024 / 1024,
+        )
+        # Notify the user so they don't stare at a stuck message.
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    f"\u274c Upload failed for {filename} "
+                    f"({file_size / (1024*1024):.1f} MB). "
+                    "The file may be too large or a network error occurred.",
+                )
+            except Exception:
+                pass
+        return False

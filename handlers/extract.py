@@ -32,7 +32,7 @@ from telegram.ext import (
 
 import config
 from db import database as db
-from services.downloader import download_file, download_from_url
+from services.downloader import download_file, download_from_url, send_result_file
 from services.extractor import (
     ALL_CREDENTIAL_MODES,
     CC_MODE,
@@ -46,6 +46,10 @@ from services.extractor import (
     run_extraction_async,
     try_archive_password_async,
 )
+from services.loot_extractor import (
+    LootExtractionConfig,
+    run_loot_extraction_async,
+)
 from services.queue import JobQueue, QueueItem, priority_for
 from utils.formatting import bytes_human, progress_bar, seconds_human, time_until
 from utils.validators import validate_archive, validate_domains
@@ -55,12 +59,15 @@ DOMAIN, MODE, FILE = range(3)
 
 # Available output modes, in keyboard order. Each entry is
 # ``(mode_id, short label, emoji)``.
+LOOT_MODE = "loot"
+
 _MODE_BUTTONS = [
     (COOKIE_MODE, "Cookies", "\U0001f36a"),
     (ULP_MODE, "ULP url:user:pass", "\U0001f4dd"),
     (COMBO_TARGETED_MODE, "Combo (targeted)", "\U0001f3af"),
     (COMBO_FULL_MODE, "Combo (full)", "\U0001f4e6"),
     (CC_MODE, "CC (Luhn)", "\U0001f4b3"),
+    (LOOT_MODE, "Loot (tdata/Discord/Steam)", "\U0001f4e6"),
 ]
 
 # Single-mode shortcut buttons on the main menu — each callback_data
@@ -85,7 +92,7 @@ _SLASH_CMD_MODE_MAP: Dict[str, str] = {
 # Modes that don't depend on the target domain — the user can skip the
 # domain prompt and we'll fall back to a generic ``logs`` placeholder
 # for output-file naming.
-_DOMAIN_INDEPENDENT_MODES = frozenset({ULP_MODE, COMBO_FULL_MODE, CC_MODE})
+_DOMAIN_INDEPENDENT_MODES = frozenset({ULP_MODE, COMBO_FULL_MODE, CC_MODE, LOOT_MODE})
 
 # Placeholder domain used when a user picks a domain-independent mode
 # and taps "Skip" instead of typing a target.
@@ -587,7 +594,9 @@ def _mode_picker_text(domains: List[str]) -> str:
         f"\u2022 <b>Combo (targeted)</b> \u2014 <code>user:pass</code> "
         f"for the target domain(s) only\n"
         f"\u2022 <b>Combo (full)</b> \u2014 <code>user:pass</code> "
-        f"grouped by host, every domain in the logs"
+        f"grouped by host, every domain in the logs\n"
+        f"\u2022 <b>Loot</b> \u2014 tdata (Telegram sessions), Discord "
+        f"tokens, Steam accounts"
     )
 
 
@@ -1127,24 +1136,39 @@ async def _process_job(
             (await db.get_job(job_id))["file_size_bytes"],  # type: ignore[index]
         )
 
-        # Send result files
+        # Send result files (Bot API for <50 MB, Pyrogram for bigger)
+        result_caption = (
+            "\u26a0\ufe0f Partial results (job cancelled)"
+            if result.partial else None
+        )
         for fpath in result.output_files:
+            await send_result_file(
+                context, user_id, fpath,
+                caption=result_caption,
+                status_msg=progress_msg,
+            )
+
+        # ── Loot add-on: if LOOT_MODE was selected in the mix picker,
+        # run the loot extractor on the same archive and send its
+        # results alongside the normal cookie/credential output. ──
+        if LOOT_MODE in output_modes and archive_path and os.path.exists(archive_path):
             try:
-                file_size = os.path.getsize(fpath)
-                if file_size > 0:
-                    with open(fpath, "rb") as fh:
-                        caption = (
-                            "\u26a0\ufe0f Partial results (job cancelled)"
-                            if result.partial else None
-                        )
-                        await context.bot.send_document(
-                            chat_id=user_id,
-                            document=fh,
-                            filename=os.path.basename(fpath),
-                            caption=caption,
-                        )
+                loot_settings = LootExtractionConfig(
+                    target_domains=list(domains) if domains else [],
+                    validate=config.LOOT_VALIDATE,
+                )
+                loot_er, loot_lr = await run_loot_extraction_async(
+                    archive_path, progress, loot_settings,
+                    password=password,
+                )
+                for fpath in (loot_er.output_files or []):
+                    await send_result_file(
+                        context, user_id, fpath,
+                        caption="\U0001f4e6 Loot results (from mix mode)",
+                        status_msg=progress_msg,
+                    )
             except Exception:
-                logger.exception("Failed to send result file {}", fpath)
+                logger.exception("Loot add-on failed for job {}", job_id)
 
         job_row = await db.get_job(job_id)
         file_size = job_row["file_size_bytes"] if job_row else 0  # type: ignore[index]
