@@ -1570,16 +1570,13 @@ def _run_extraction_zip_stream(
                 is_pwd = want_creds and log_parser.is_password_file(member.filename)
                 # CC scanning runs on both dedicated CC files and on
                 # password dumps — many stealers inline CC data right
-                # next to the passwords block. ``cc_strict`` is True
-                # for password files (require MM/YY/CVV near each hit)
-                # to drop the long tail of timestamp/order-ID false
-                # positives that pass Luhn coincidentally.
-                is_dedicated_cc = log_parser.is_cc_file(member.filename)
+                # next to the passwords block. The parser is uniformly
+                # strict now (full NUMBER|MM|YY|CVV required, brand &
+                # exp validation), so we don't need a per-file toggle.
                 is_cc_candidate = want_cc and (
-                    is_dedicated_cc
+                    log_parser.is_cc_file(member.filename)
                     or log_parser.is_password_file(member.filename)
                 )
-                cc_strict = not is_dedicated_cc
 
                 # Read once, parse for cookies + credentials + CCs as
                 # requested. Tabbed cookie files have no ``@`` lines so
@@ -1610,7 +1607,7 @@ def _run_extraction_zip_stream(
                         creds.append(c)
 
                 if is_cc_candidate:
-                    for card in log_parser.parse_credit_cards(text, strict=cc_strict):
+                    for card in log_parser.parse_credit_cards(text):
                         existing = cc_by_num.get(card.number)
                         if existing is None:
                             cc_by_num[card.number] = card
@@ -1968,8 +1965,7 @@ def _collect_cc_from_dir(
                 text = raw.decode("utf-8", errors="ignore")
             except Exception:
                 continue
-            strict = not log_parser.is_cc_file(fpath)
-            for card in log_parser.parse_credit_cards(text, strict=strict):
+            for card in log_parser.parse_credit_cards(text):
                 existing = by_num.get(card.number)
                 if existing is None:
                     by_num[card.number] = card
