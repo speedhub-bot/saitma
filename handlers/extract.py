@@ -348,6 +348,30 @@ async def extract_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await update.message.reply_text(text)  # type: ignore[union-attr]
         return ConversationHandler.END
 
+    # Mix mode (no preset_mode): skip the domain prompt entirely and go
+    # straight to the format picker. After the user finishes picking
+    # modes we only re-prompt for a domain if at least one of the
+    # selected modes actually needs one (cookies / combo-targeted).
+    # Domain-independent modes (loot/CC/ULP/combo-full) never bother
+    # the user with a domain prompt.
+    if not preset_mode:
+        context.user_data["extract_domains"] = [_DEFAULT_PLACEHOLDER_DOMAIN]  # type: ignore[index]
+        context.user_data["extract_domain"] = _DEFAULT_PLACEHOLDER_DOMAIN  # type: ignore[index]
+        context.user_data["extract_modes"] = set()  # type: ignore[index]
+        context.user_data.pop("extract_modes_locked", None)  # type: ignore[union-attr]
+        picker_text = _mode_picker_text([_DEFAULT_PLACEHOLDER_DOMAIN])
+        kb = _mode_picker_kb(set(), [_DEFAULT_PLACEHOLDER_DOMAIN])
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                picker_text, reply_markup=kb, parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(  # type: ignore[union-attr]
+                picker_text, reply_markup=kb, parse_mode="HTML",
+            )
+        return MODE
+
     # Mode-specific intro + optional Skip button for domain-independent
     # modes (ULP, Combo Full, CC — they scan the whole archive).
     if preset_mode == COOKIE_MODE:
@@ -468,11 +492,24 @@ async def domain_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return FILE
 
-    # Initialise the mode-selection state with sane defaults: cookies
-    # only (the legacy behavior) so the user can just hit "Done" if they
-    # only care about cookie extraction.
-    context.user_data["extract_modes"] = {COOKIE_MODE}  # type: ignore[index]
+    # Mix-mode "back-fill" path: the user already picked their output
+    # formats and we redirected them here because they picked a
+    # domain-dependent one. Re-use the locked-in modes and go straight
+    # to FILE without re-showing the picker.
+    if context.user_data.get("extract_modes_locked"):  # type: ignore[union-attr]
+        context.user_data.pop("extract_modes_locked", None)  # type: ignore[union-attr]
+        modes = context.user_data.get(  # type: ignore[union-attr]
+            "extract_modes",
+        ) or {COOKIE_MODE}
+        prompt = await _build_file_prompt(user.id, domains, modes)
+        await update.message.reply_text(
+            prompt, reply_markup=_cancel_kb(),
+        )
+        return FILE
 
+    # Legacy mix-entry that still landed on DOMAIN first (e.g. older
+    # callback wiring): initialise the picker and move on.
+    context.user_data["extract_modes"] = {COOKIE_MODE}  # type: ignore[index]
     await update.message.reply_text(
         _mode_picker_text(domains),
         reply_markup=_mode_picker_kb(context.user_data["extract_modes"], domains),  # type: ignore[union-attr]
@@ -577,24 +614,32 @@ async def _build_file_prompt(
 
 # ── State: MODE ────────────────────────────────────────────
 def _mode_picker_text(domains: List[str]) -> str:
-    domain_label = (
-        domains[0] if len(domains) == 1
-        else f"{len(domains)} domains"
-    )
+    if not domains or domains[0] == _DEFAULT_PLACEHOLDER_DOMAIN:
+        target_line = (
+            "\U0001f310 Target: <i>no domain yet \u2014 only asked if "
+            "you pick Cookies or Combo (targeted)</i>"
+        )
+    else:
+        domain_label = (
+            domains[0] if len(domains) == 1
+            else f"{len(domains)} domains"
+        )
+        target_line = f"\U0001f310 Target: <code>{domain_label}</code>"
     return (
         f"\u2699\ufe0f <b>Output format</b>\n"
-        f"\U0001f310 Target: <code>{domain_label}</code>\n\n"
+        f"{target_line}\n\n"
         f"Pick one or more formats. Toggle each on/off, then tap "
         f"<b>Done</b>. You can mix cookies with credential exports — "
         f"the archive is only scanned once.\n\n"
         f"\u2022 <b>Cookies</b> \u2014 Netscape <code>.txt</code> per "
-        f"target domain (legacy)\n"
+        f"target domain (needs domain)\n"
         f"\u2022 <b>ULP</b> \u2014 every <code>url:user:pass</code> in "
         f"the logs, deduped\n"
         f"\u2022 <b>Combo (targeted)</b> \u2014 <code>user:pass</code> "
-        f"for the target domain(s) only\n"
+        f"for the target domain(s) only (needs domain)\n"
         f"\u2022 <b>Combo (full)</b> \u2014 <code>user:pass</code> "
         f"grouped by host, every domain in the logs\n"
+        f"\u2022 <b>CC</b> \u2014 Luhn-valid card dumps\n"
         f"\u2022 <b>Loot</b> \u2014 tdata (Telegram sessions), Discord "
         f"tokens, Steam accounts"
     )
@@ -650,7 +695,13 @@ async def mode_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def mode_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """User finished picking output modes — move on to the FILE state."""
+    """User finished picking output modes — move on to the FILE state.
+
+    If at least one domain-dependent mode was selected (cookies or
+    combo-targeted) and the user hasn't provided a real domain yet,
+    bounce back to the DOMAIN state. Everything else (loot, CC, ULP,
+    combo-full) proceeds straight to FILE.
+    """
     q = update.callback_query
     user = update.effective_user
     if q is None or user is None:
@@ -668,6 +719,47 @@ async def mode_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return MODE
 
     domains: list[str] = context.user_data.get("extract_domains", [])  # type: ignore[union-attr]
+    has_real_domain = bool(
+        domains and domains[0] != _DEFAULT_PLACEHOLDER_DOMAIN,
+    )
+    needs_domain = bool(selected & {COOKIE_MODE, COMBO_TARGETED_MODE})
+    if needs_domain and not has_real_domain:
+        # Stash the picked modes so domain_received can pick up where
+        # we left off without re-showing the picker.
+        context.user_data["extract_modes_locked"] = True  # type: ignore[index]
+        labels = ", ".join(
+            label
+            for mid, label, _emoji in _MODE_BUTTONS
+            if mid in selected
+        )
+        text = (
+            "\U0001f310 <b>Target domain needed</b>\n"
+            f"You picked: <b>{labels}</b>\n"
+            "Enter one or more domains (comma/space separated) to filter "
+            f"cookies / targeted combos.\n"
+            f"Up to {config.MAX_DOMAINS_PER_EXTRACT} domains."
+        )
+        try:
+            await q.edit_message_text(
+                text, reply_markup=_cancel_kb(), parse_mode="HTML",
+            )
+        except Exception:
+            if update.effective_chat is not None:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=text,
+                    reply_markup=_cancel_kb(),
+                    parse_mode="HTML",
+                )
+        return DOMAIN
+
+    # Domain-independent selection → drop the placeholder so output
+    # files aren't named "logs_*".
+    if not has_real_domain:
+        context.user_data["extract_domains"] = []  # type: ignore[index]
+        context.user_data.pop("extract_domain", None)  # type: ignore[union-attr]
+        domains = []
+
     text = await _build_file_prompt(user.id, domains, selected)
     try:
         await q.edit_message_text(text, reply_markup=_cancel_kb())
@@ -1150,12 +1242,44 @@ async def _process_job(
 
         # ── Loot add-on: if LOOT_MODE was selected in the mix picker,
         # run the loot extractor on the same archive and send its
-        # results alongside the normal cookie/credential output. ──
+        # results alongside the normal cookie/credential output.
+        # Important: when the user *also* picked ULP / combo / CC
+        # modes those credentials are already covered by the main
+        # extractor — so the loot pipeline only scans the
+        # tdata / Discord / Steam buckets. Otherwise the user would
+        # get duplicated (and possibly differently formatted) password
+        # dumps inside loot_results.zip.
         if LOOT_MODE in output_modes and archive_path and os.path.exists(archive_path):
             try:
+                from services.loot_extractor import (
+                    LOOT_DISCORD,
+                    LOOT_PASSWORDS,
+                    LOOT_STEAM,
+                    LOOT_TDATA,
+                )
+
+                loot_buckets: frozenset[str] = frozenset(
+                    {LOOT_TDATA, LOOT_DISCORD, LOOT_STEAM},
+                )
+                # Honour an explicit override from /loot (if a user
+                # somehow lands here with one) but default to the
+                # no-passwords set above for the mix flow.
+                pre_buckets = context.user_data.get(  # type: ignore[union-attr]
+                    "loot_buckets"
+                ) if hasattr(context, "user_data") else None
+                if pre_buckets:
+                    loot_buckets = frozenset(pre_buckets)
+                else:
+                    # If user explicitly asked for ULP/combo password
+                    # dumps from the main extractor, drop them from the
+                    # loot zip to avoid duplicates.
+                    if output_modes & ALL_CREDENTIAL_MODES:
+                        loot_buckets = loot_buckets - {LOOT_PASSWORDS}
+
                 loot_settings = LootExtractionConfig(
                     target_domains=list(domains) if domains else [],
                     validate=config.LOOT_VALIDATE,
+                    buckets=loot_buckets,
                 )
                 loot_er, loot_lr = await run_loot_extraction_async(
                     archive_path, progress, loot_settings,
@@ -1793,6 +1917,51 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         fut.set_result(None)
 
 
+def _format_loot_dashboard(progress: ExtractionProgress) -> str:
+    """Compact per-bucket breakdown shown inside the live dashboard.
+
+    Reads the optional ``loot_*`` fields on the progress object. Returns
+    an empty string when no loot scan is in progress so the cookie /
+    credential dashboards stay unchanged for users who don't use loot.
+    """
+    counts = getattr(progress, "loot_counts", {}) or {}
+    valid_counts = getattr(progress, "loot_valid_counts", {}) or {}
+    active = getattr(progress, "loot_bucket", "") or ""
+    if not counts and not active:
+        return ""
+    bucket_emoji = {
+        "tdata": "\U0001f4f1",
+        "discord": "\U0001f3ae",
+        "steam": "\U0001f3ae",
+        "passwords": "\U0001f511",
+    }
+    lines: List[str] = ["\U0001f4e6 Loot scanners"]
+    for name in ("tdata", "discord", "steam", "passwords"):
+        if name not in counts and name != active:
+            continue
+        emoji = bucket_emoji.get(name, "\u2022")
+        if name in counts:
+            n = counts[name]
+            extra = ""
+            if name == "discord" and "discord" in valid_counts:
+                extra = f" ({valid_counts['discord']} live)"
+            elif name == "steam" and "steam" in valid_counts:
+                extra = f" ({valid_counts['steam']} live)"
+            done_mark = "\u2705"
+            lines.append(
+                f"   {emoji} {name:<10s} {done_mark} {n:,}{extra}"
+            )
+        else:
+            lines.append(f"   {emoji} {name:<10s} \u23f3 running\u2026")
+    val_total = getattr(progress, "loot_validate_total", 0) or 0
+    val_done = getattr(progress, "loot_validate_done", 0) or 0
+    if val_total:
+        lines.append(
+            f"   \U0001f6e1 Validating {val_done}/{val_total}"
+        )
+    return "\n".join(lines)
+
+
 async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> None:
     """Edit the progress message every few seconds with a live dashboard."""
     start = time.monotonic()
@@ -1875,6 +2044,7 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     / max(rate, 0.001)
                     if progress.files_total else 0
                 )
+                loot_dash = _format_loot_dashboard(progress)
                 text = (
                     f"\u2699\ufe0f Live Dashboard\n"
                     f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -1886,20 +2056,47 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     f"   Now: {cur_file}\n"
                     f"\U0001f36a Cookies found so far: "
                     f"{progress.cookies_found:,}\n"
+                    f"\U0001f4dd Credentials so far: "
+                    f"{progress.credentials_found:,}\n"
                     f"\u26a1 Rate: {rate:.1f} files/s   ETA: {seconds_human(eta)}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
-            elif progress.phase == "packaging":
+                if loot_dash:
+                    text += "\n" + loot_dash
+            elif progress.phase == "validating":
+                val_total = progress.loot_validate_total or 0
+                val_done = progress.loot_validate_done or 0
+                pct = (val_done / max(val_total, 1)) * 100 if val_total else 0
+                loot_dash = _format_loot_dashboard(progress)
                 text = (
                     f"\u2699\ufe0f Live Dashboard\n"
                     f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                     f"\U0001f4e5 Download:  Done \u2705\n"
                     f"\U0001f4c2 Extract:   Done \u2705\n"
                     f"\U0001f50d Scan:      Done \u2705\n"
-                    f"\U0001f4e6 Packaging cookies into .zip\u2026\n"
-                    f"\U0001f36a Cookies found: {progress.cookies_found:,}\n"
+                    f"\U0001f6e1 Validating tokens / accounts\n"
+                    f"   {progress_bar(val_done, val_total)} {pct:.0f}% "
+                    f"({val_done:,}/{val_total:,})\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
+                if loot_dash:
+                    text += "\n" + loot_dash
+            elif progress.phase == "packaging":
+                loot_dash = _format_loot_dashboard(progress)
+                text = (
+                    f"\u2699\ufe0f Live Dashboard\n"
+                    f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+                    f"\U0001f4e5 Download:  Done \u2705\n"
+                    f"\U0001f4c2 Extract:   Done \u2705\n"
+                    f"\U0001f50d Scan:      Done \u2705\n"
+                    f"\U0001f4e6 Packaging results into .zip\u2026\n"
+                    f"\U0001f36a Cookies found: {progress.cookies_found:,}\n"
+                    f"\U0001f4dd Credentials found: "
+                    f"{progress.credentials_found:,}\n"
+                    f"\u23f1 Elapsed: {seconds_human(elapsed)}"
+                )
+                if loot_dash:
+                    text += "\n" + loot_dash
             else:
                 continue
 
