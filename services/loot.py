@@ -1,13 +1,11 @@
 """
-Loot scanning: detect Telegram ``tdata`` sessions, Discord tokens,
-Steam accounts and saved-password entries (ULP + combos) inside a
-directory tree extracted from an infostealer log archive.
+Loot scanning: detect Discord tokens, Steam accounts and saved-password
+entries (ULP + combos) inside a directory tree extracted from an
+infostealer log archive.
 
 The scanners are deliberately strict so that the output is high signal
 ("no trash"): tokens must match the exact format the issuing service
-uses, vdf files are parsed properly, and tdata folders are validated
-against the Telegram Desktop binary layout (``TDF$`` magic + the
-``[A-F0-9]{16}`` keyfile + matching subfolder).
+uses and vdf files are parsed properly.
 
 Live validation (Discord ``/users/@me``, Steam community xml) is opt-in
 via :func:`validate_loot_async`; the scanners themselves are pure
@@ -67,17 +65,6 @@ _PWD_FILENAMES = re.compile(
     re.IGNORECASE,
 )
 
-# ─── tdata layout ───────────────────────────────────────────────────
-
-# Telegram Desktop drops session files inside a ``tdata`` directory.
-# The main "key file" sits at the root of tdata and is named after a
-# 16-hex-char prefix (default ``D877F783D5D3EF8C`` for the implicit
-# local key when no local password is set). The same prefix is also
-# used as the name of the subfolder holding the encrypted user state.
-_TDATA_KEYFILE_RE = re.compile(r"^[A-Fa-f0-9]{16}s?$")
-_TDATA_KEYFOLDER_RE = re.compile(r"^[A-Fa-f0-9]{16}$")
-_TDATA_MAGIC = b"TDF$"
-
 # ─── Steam ──────────────────────────────────────────────────────────
 
 # Steam stores known logins in ``config/loginusers.vdf`` (text VDF).
@@ -90,25 +77,6 @@ _LOGINUSERS_RE = re.compile(r"loginusers\.vdf$", re.IGNORECASE)
 # ════════════════════════════════════════════════════════════════════
 #  Dataclasses — public result types
 # ════════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class TdataAccount:
-    """A Telegram Desktop session folder found inside the logs."""
-
-    root: str
-    """Absolute path of the ``tdata`` (or ``tdata/Telegram``) folder."""
-
-    keyfile: str = ""
-    """Filename of the 16-hex keyfile (without the trailing ``s``)."""
-
-    key_datas_size: int = 0
-    has_maps: bool = False
-    has_tdf_magic: bool = False
-    info_path: str = ""
-    info: Dict[str, str] = field(default_factory=dict)
-    valid: bool = False
-    reason: str = ""
 
 
 @dataclass
@@ -170,7 +138,6 @@ class CredentialEntry:
 class LootResult:
     """Aggregated output of a full log-archive scan."""
 
-    tdata: List[TdataAccount] = field(default_factory=list)
     discord: List[DiscordToken] = field(default_factory=list)
     steam: List[SteamAccount] = field(default_factory=list)
     credentials: List[CredentialEntry] = field(default_factory=list)
@@ -239,162 +206,6 @@ def _walk_files(root: str) -> Iterable[Tuple[str, str]]:
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
             yield dirpath, name
-
-
-# ════════════════════════════════════════════════════════════════════
-#  tdata scanner
-# ════════════════════════════════════════════════════════════════════
-
-
-def _looks_like_tdata(path: str) -> Optional[TdataAccount]:
-    """If *path* (a directory) looks like a Telegram Desktop ``tdata``
-    folder return a partially-populated :class:`TdataAccount`.
-
-    To avoid bundling random unrelated ``Telegram`` folders (e.g. the
-    Documents/Photos cache) we require **both** the ``key_datas`` file
-    *and* a 16-hex keyfile sibling. A bare ``key_datas`` alone or a
-    bare keyfile alone is rejected.
-    """
-    try:
-        entries = os.listdir(path)
-    except OSError:
-        return None
-    has_key_datas = "key_datas" in entries
-    keyfile = ""
-    keyfolder = ""
-    for name in entries:
-        if _TDATA_KEYFILE_RE.match(name) and os.path.isfile(
-            os.path.join(path, name)
-        ):
-            # Prefer the no-suffix variant; ``foo`` over ``foos``.
-            if not name.endswith("s") or not keyfile:
-                keyfile = name.rstrip("s")
-        if _TDATA_KEYFOLDER_RE.match(name) and os.path.isdir(
-            os.path.join(path, name)
-        ):
-            keyfolder = name
-    # Strict: a real tdata folder always carries both pieces. Folders
-    # with only one are almost always false positives (e.g. random
-    # ``Telegram`` doc caches in stealer dumps).
-    if not (has_key_datas and keyfile):
-        return None
-    acc = TdataAccount(root=path, keyfile=keyfile)
-    key_path = os.path.join(path, "key_datas")
-    try:
-        with open(key_path, "rb") as fh:
-            head = fh.read(4)
-        acc.key_datas_size = os.path.getsize(key_path)
-        acc.has_tdf_magic = head == _TDATA_MAGIC
-    except OSError:
-        pass
-    if keyfolder:
-        maps_path = os.path.join(path, keyfolder, "maps")
-        acc.has_maps = os.path.isfile(maps_path)
-    return acc
-
-
-def _populate_account_info(acc: TdataAccount, root: str) -> None:
-    """Look for a sibling ``account_info.txt`` (Vidar/Lumma drop a
-    pre-extracted summary) and parse it into ``acc.info``."""
-    candidates: List[str] = []
-    parent = os.path.dirname(acc.root.rstrip(os.sep))
-    grand = os.path.dirname(parent)
-    for base in (acc.root, parent, grand):
-        if not base:
-            continue
-        for name in ("account_info.txt", "Telegram.txt",
-                     "session_info.txt", "info.txt"):
-            cand = os.path.join(base, name)
-            if os.path.isfile(cand) and cand not in candidates:
-                candidates.append(cand)
-        # Also scan the whole containing log folder for any txt that
-        # mentions tdata-typical headers.
-    if not candidates:
-        # Fall back: scan the immediate parent folder for any ``*.txt``
-        # containing a "Phone" header — common in Vidar/Cryptbot dumps.
-        for base in (parent, grand):
-            if not base or not os.path.isdir(base):
-                continue
-            try:
-                for entry in os.scandir(base):
-                    if (
-                        entry.is_file()
-                        and entry.name.lower().endswith(".txt")
-                        and entry.stat().st_size < 32 * 1024
-                    ):
-                        head = _read_text(entry.path, max_bytes=4096)
-                        if "Phone" in head and ("User ID" in head
-                                                or "UserID" in head):
-                            candidates.append(entry.path)
-                            break
-            except OSError:
-                continue
-            if candidates:
-                break
-
-    if not candidates:
-        return
-    text = _read_text(candidates[0], max_bytes=64 * 1024)
-    if not text:
-        return
-    acc.info_path = candidates[0]
-    for raw_line in text.splitlines():
-        m = _PWD_FIELD_RE.match(raw_line)
-        if not m:
-            continue
-        key = m.group(1).strip().lower()
-        val = m.group(2).strip()
-        if not val or val == "—" or val == "-":
-            continue
-        # Normalise the keys we care about.
-        key_norm = re.sub(r"\s+", "_", key)
-        # Skip header-decoration matches like "=== ACCOUNT INFO ===".
-        if key_norm.startswith("==="):
-            continue
-        acc.info[key_norm] = val
-
-
-def scan_tdata(root: str) -> List[TdataAccount]:
-    """Walk *root* and return every ``tdata`` folder found.
-
-    Detection accepts the two layouts seen in the wild:
-
-    * ``.../tdata/Telegram/`` containing the keyfile + ``key_datas``
-      (current Telegram Desktop), and
-    * ``.../tdata/`` directly containing the same files (older /
-      stealer-rehosted dumps).
-    """
-    found: List[TdataAccount] = []
-    seen_roots: set[str] = set()
-
-    for dirpath, _dirs, _files in os.walk(root):
-        name = os.path.basename(dirpath).lower()
-        if name not in ("tdata", "telegram"):
-            continue
-        candidate = _looks_like_tdata(dirpath)
-        if candidate and candidate.root not in seen_roots:
-            seen_roots.add(candidate.root)
-            _populate_account_info(candidate, root)
-            candidate.valid, candidate.reason = _validate_tdata(candidate)
-            found.append(candidate)
-    return found
-
-
-def _validate_tdata(acc: TdataAccount) -> Tuple[bool, str]:
-    """Structural validation. We don't connect to MTProto here — that
-    would require a heavyweight Telegram client per session. Instead
-    we verify the layout matches Telegram Desktop's on-disk format so
-    the bundle we send back is at least *loadable* by tdesktop /
-    opentele."""
-    if acc.key_datas_size == 0:
-        return False, "key_datas missing"
-    if not acc.has_tdf_magic:
-        return False, "key_datas header is not TDF$"
-    if not acc.keyfile:
-        return False, "16-hex keyfile not found"
-    if not acc.has_maps:
-        return False, "session data folder missing maps file"
-    return True, ""
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -840,9 +651,9 @@ def scan_directory_for_loot(
     aggregated result.
 
     *buckets* is an optional frozenset of bucket identifiers (e.g.
-    ``{"loot_tdata", "loot_discord"}``).  When ``None`` or empty **all**
-    scanners run.  Pass specific bucket constants from
-    ``services.loot_extractor`` to limit the scan.
+    ``{"loot_discord"}``).  When ``None`` or empty **all** scanners run.
+    Pass specific bucket constants from ``services.loot_extractor`` to
+    limit the scan.
 
     When *progress* is provided it must expose the fields defined on
     :class:`services.extractor.ExtractionProgress` (``loot_bucket`` +
@@ -866,14 +677,6 @@ def scan_directory_for_loot(
             except Exception:
                 pass
 
-    if run_all or "loot_tdata" in buckets:
-        _set_bucket("tdata")
-        try:
-            result.tdata = scan_tdata(root)
-            _record_count("tdata", len(result.tdata))
-        except Exception as exc:
-            logger.exception("scan_tdata failed")
-            result.errors.append(f"tdata scan failed: {exc}")
     if run_all or "loot_discord" in buckets:
         _set_bucket("discord")
         try:
@@ -1020,9 +823,7 @@ async def validate_loot_async(
     """Run the optional network-validation pass.
 
     Discord tokens and Steam accounts are hit in parallel with a small
-    concurrency budget to stay polite. tdata sessions are not
-    network-validated here (that requires a Telegram client per
-    session; structure validation has already been done).
+    concurrency budget to stay polite.
 
     When *progress* is passed in (an :class:`ExtractionProgress`-shaped
     object) the dashboard fields ``loot_validate_total`` /

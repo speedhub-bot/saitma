@@ -63,9 +63,9 @@ def _main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
                 "\U0001f9e9 Mix Modes", callback_data="extract",
             ),
         ],
-        # Row 4 — Loot (tdata / Discord / Steam / combos)
+        # Row 4 — Loot (Discord / Steam / combos)
         [InlineKeyboardButton(
-            "\U0001f4e6 Loot (tdata / Discord / Steam)",
+            "\U0001f4e6 Loot (Discord / Steam)",
             callback_data="loot",
         )],
         [

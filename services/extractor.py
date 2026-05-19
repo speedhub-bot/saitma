@@ -305,8 +305,8 @@ class ExtractionProgress:
     current_password_attempt: str = ""
     password_attempts: List[str] = field(default_factory=list)
     # Loot-specific dashboard fields. ``loot_bucket`` is the
-    # currently-running scanner (``tdata`` / ``discord`` / ``steam`` /
-    # ``passwords`` / ``validate``). ``loot_counts`` is updated as each
+    # currently-running scanner (``discord`` / ``steam`` / ``passwords`` /
+    # ``validate``). ``loot_counts`` is updated as each
     # bucket finishes with the number of raw hits before validation.
     # ``loot_valid_counts`` carries the post-validation live counts.
     loot_bucket: str = ""
