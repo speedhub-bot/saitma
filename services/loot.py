@@ -1,7 +1,6 @@
 """
-Loot scanning: detect Discord tokens, Steam accounts and saved-password
-entries (ULP + combos) inside a directory tree extracted from an
-infostealer log archive.
+Loot scanning: detect Discord tokens and Steam accounts inside a
+directory tree extracted from an infostealer log archive.
 
 The scanners are deliberately strict so that the output is high signal
 ("no trash"): tokens must match the exact format the issuing service
@@ -10,6 +9,13 @@ uses and vdf files are parsed properly.
 Live validation (Discord ``/users/@me``, Steam community xml) is opt-in
 via :func:`validate_loot_async`; the scanners themselves are pure
 filesystem walks and never touch the network.
+
+Note: tdata (Telegram session) extraction and saved-password / ULP
+dumping used to live here too. ``tdata`` produced too many false
+positives on real-world stealer dumps and was removed entirely; ULP /
+combo dumping is now exclusive to :mod:`services.extractor` and the
+``/ulp`` / ``/combo`` modes — having two parallel parsers caused
+duplicated output inside ``loot_results.zip``.
 """
 
 from __future__ import annotations
@@ -45,25 +51,6 @@ _DISCORD_TOKEN_RE = re.compile(
 # Bytes that often surround a real token inside LevelDB blobs — used to
 # strip leading "token: " or trailing quote / null junk after a match.
 _DISCORD_STRIP_RE = re.compile(r"[\"',\s\x00-\x1f]")
-
-# Standard stealer password block headers (Vidar, Redline, Raccoon,
-# Lumma, Stealc, Mars, Meta etc.). We try a few synonyms per field.
-_PWD_URL_KEYS = ("url", "host", "hostname", "soft", "softs", "site")
-_PWD_USER_KEYS = ("login", "user", "username", "user name", "email")
-_PWD_PASS_KEYS = ("password", "passwords", "pass", "pwd")
-
-_PWD_FIELD_RE = re.compile(
-    r"^\s*([A-Za-z][A-Za-z _]+?)\s*[:=]\s*(.*?)\s*$"
-)
-
-# Stealer dumps name their saved-password files several different
-# ways. We treat anything matching this as a candidate.
-_PWD_FILENAMES = re.compile(
-    r"^(all[_\- ]?)?passwords?(\s*\(\d+\))?\.txt$"
-    r"|^saved[_\- ]?passwords?\.txt$"
-    r"|^pwd\.txt$",
-    re.IGNORECASE,
-)
 
 # ─── Steam ──────────────────────────────────────────────────────────
 
@@ -123,24 +110,11 @@ class SteamAccount:
 
 
 @dataclass
-class CredentialEntry:
-    """A single ``URL : USER : PASS`` block from a stealer password dump."""
-
-    url: str
-    username: str
-    password: str
-    source_file: str
-    domain: str = ""
-    soft: str = ""
-
-
-@dataclass
 class LootResult:
     """Aggregated output of a full log-archive scan."""
 
     discord: List[DiscordToken] = field(default_factory=list)
     steam: List[SteamAccount] = field(default_factory=list)
-    credentials: List[CredentialEntry] = field(default_factory=list)
     scanned_files: int = 0
     errors: List[str] = field(default_factory=list)
 
@@ -206,6 +180,7 @@ def _walk_files(root: str) -> Iterable[Tuple[str, str]]:
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
             yield dirpath, name
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -546,96 +521,6 @@ def scan_steam(root: str) -> List[SteamAccount]:
     return accounts
 
 
-# ════════════════════════════════════════════════════════════════════
-#  Password file scanner (ULP + combos)
-# ════════════════════════════════════════════════════════════════════
-
-
-def _parse_password_dump(text: str, source: str) -> List[CredentialEntry]:
-    """Parse a stealer-style ``Passwords.txt`` block format.
-
-    Blocks look like::
-
-        URL: https://example.com/login
-        Username: alice
-        Password: hunter2
-
-    with variants for ``Host`` / ``Soft`` / ``Login`` headers. Blocks
-    are separated by blank lines, ``=`` rules, or the start of the
-    next ``URL:`` header.
-    """
-    entries: List[CredentialEntry] = []
-    cur: Dict[str, str] = {}
-
-    def flush() -> None:
-        url = cur.get("url", "")
-        user = cur.get("user", "")
-        pwd = cur.get("pass", "")
-        if (url or user) and pwd:
-            entries.append(
-                CredentialEntry(
-                    url=url,
-                    username=user,
-                    password=pwd,
-                    source_file=source,
-                    domain=_domain_from_url(url) or _domain_from_url(
-                        cur.get("soft", "")
-                    ),
-                    soft=cur.get("soft", ""),
-                )
-            )
-        cur.clear()
-
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        if not line.strip():
-            # blank line ends the block
-            if cur:
-                flush()
-            continue
-        if set(line.strip()) <= set("=-_*\t "):
-            if cur:
-                flush()
-            continue
-        m = _PWD_FIELD_RE.match(line)
-        if not m:
-            continue
-        key = m.group(1).strip().lower()
-        val = m.group(2).strip()
-        if not val:
-            continue
-        if key in _PWD_URL_KEYS:
-            if "url" in cur:
-                flush()
-            cur["url"] = val
-            if key == "soft":
-                cur["soft"] = val
-        elif key in _PWD_USER_KEYS:
-            cur["user"] = val
-        elif key in _PWD_PASS_KEYS:
-            cur["pass"] = val
-            # password is always the last field in a block — flush.
-            flush()
-    if cur:
-        flush()
-    return entries
-
-
-def scan_passwords(root: str) -> List[CredentialEntry]:
-    """Find every recognised saved-password file in *root* and return
-    a flat list of credential entries."""
-    out: List[CredentialEntry] = []
-    for dirpath, name in _walk_files(root):
-        if not _PWD_FILENAMES.match(name):
-            continue
-        path = os.path.join(dirpath, name)
-        rel = os.path.relpath(path, root)
-        text = _read_text(path, max_bytes=32 * 1024 * 1024)
-        if not text:
-            continue
-        out.extend(_parse_password_dump(text, rel))
-    return out
-
 
 # ════════════════════════════════════════════════════════════════════
 #  Public orchestration entry
@@ -651,9 +536,9 @@ def scan_directory_for_loot(
     aggregated result.
 
     *buckets* is an optional frozenset of bucket identifiers (e.g.
-    ``{"loot_discord"}``).  When ``None`` or empty **all** scanners run.
-    Pass specific bucket constants from ``services.loot_extractor`` to
-    limit the scan.
+    ``{"loot_discord", "loot_steam"}``).  When ``None`` or empty **all**
+    scanners run.  Pass specific bucket constants from
+    ``services.loot_extractor`` to limit the scan.
 
     When *progress* is provided it must expose the fields defined on
     :class:`services.extractor.ExtractionProgress` (``loot_bucket`` +
@@ -693,14 +578,6 @@ def scan_directory_for_loot(
         except Exception as exc:
             logger.exception("scan_steam failed")
             result.errors.append(f"steam scan failed: {exc}")
-    if run_all or "loot_passwords" in buckets:
-        _set_bucket("passwords")
-        try:
-            result.credentials = scan_passwords(root)
-            _record_count("passwords", len(result.credentials))
-        except Exception as exc:
-            logger.exception("scan_passwords failed")
-            result.errors.append(f"password scan failed: {exc}")
     _set_bucket("")
     return result
 
@@ -900,90 +777,3 @@ async def validate_loot_async(
             pass
 
 
-# ════════════════════════════════════════════════════════════════════
-#  ULP / Combo output builders
-# ════════════════════════════════════════════════════════════════════
-
-
-def build_ulp_text(entries: Iterable[CredentialEntry]) -> str:
-    """Render ``URL:USER:PASS`` per line."""
-    lines: List[str] = []
-    for e in entries:
-        if not (e.username and e.password):
-            continue
-        url = e.url or e.soft or e.domain or "unknown"
-        # Replace ``:`` inside the url with %3A so the trailing
-        # ``:user:pass`` split is unambiguous.
-        url_safe = url.replace("\n", " ").replace("\r", " ")
-        user_safe = e.username.replace("\n", " ")
-        pwd_safe = e.password.replace("\n", " ")
-        lines.append(f"{url_safe}:{user_safe}:{pwd_safe}")
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def build_combo_text(entries: Iterable[CredentialEntry]) -> str:
-    """Render ``USER:PASS`` per line (no URL)."""
-    lines: List[str] = []
-    seen: set[Tuple[str, str]] = set()
-    for e in entries:
-        if not (e.username and e.password):
-            continue
-        key = (e.username, e.password)
-        if key in seen:
-            continue
-        seen.add(key)
-        lines.append(f"{e.username}:{e.password}")
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def build_structured_combo_text(
-    entries: Iterable[CredentialEntry],
-) -> str:
-    """Render combos grouped by domain header::
-
-        === claude.ai ===
-        user1:pass1
-        user2:pass2
-
-        === spotify.com ===
-        user3:pass3
-    """
-    by_domain: Dict[str, List[CredentialEntry]] = {}
-    for e in entries:
-        if not (e.username and e.password):
-            continue
-        key = e.domain or "unknown"
-        by_domain.setdefault(key, []).append(e)
-
-    chunks: List[str] = []
-    for domain in sorted(by_domain.keys()):
-        chunks.append(f"=== {domain} ===")
-        seen: set[Tuple[str, str]] = set()
-        for e in by_domain[domain]:
-            t = (e.username, e.password)
-            if t in seen:
-                continue
-            seen.add(t)
-            chunks.append(f"{e.username}:{e.password}")
-        chunks.append("")
-    return "\n".join(chunks).rstrip() + "\n" if chunks else ""
-
-
-def filter_credentials(
-    entries: Iterable[CredentialEntry],
-    target_domains: Iterable[str],
-) -> List[CredentialEntry]:
-    """Return only entries whose ``domain`` matches one of *target_domains*
-    (substring match, case-insensitive)."""
-    needles = [d.strip().lower().lstrip(".") for d in target_domains
-               if d and d.strip()]
-    if not needles:
-        return list(entries)
-    out: List[CredentialEntry] = []
-    for e in entries:
-        haystack = (
-            e.domain or _domain_from_url(e.url) or e.soft or e.url
-        ).lower()
-        if any(n in haystack for n in needles):
-            out.append(e)
-    return out

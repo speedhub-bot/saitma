@@ -243,7 +243,7 @@ def main() -> None:
                 BotCommand("extract", "Mix modes (pick multiple)"),
                 BotCommand(
                     "loot",
-                    "Loot Discord + Steam + ULP/combos",
+                    "Loot — Discord tokens + Steam accounts",
                 ),
                 BotCommand("mystats", "Show your usage stats"),
                 BotCommand("help", "How to use the bot"),

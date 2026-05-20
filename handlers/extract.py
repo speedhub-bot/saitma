@@ -94,6 +94,12 @@ _SLASH_CMD_MODE_MAP: Dict[str, str] = {
 # for output-file naming.
 _DOMAIN_INDEPENDENT_MODES = frozenset({ULP_MODE, COMBO_FULL_MODE, CC_MODE, LOOT_MODE})
 
+# Modes whose output is filtered by the target domain list. Only these
+# benefit from the "Search more domains" rescan button — picking ULP /
+# Combo (full) / CC / Loot processes the whole archive regardless of
+# domain so there's nothing to "re-search" for.
+_DOMAIN_DEPENDENT_MODES = frozenset({COOKIE_MODE, COMBO_TARGETED_MODE})
+
 # Placeholder domain used when a user picks a domain-independent mode
 # and taps "Skip" instead of typing a target.
 _DEFAULT_PLACEHOLDER_DOMAIN = "logs"
@@ -1099,7 +1105,10 @@ async def _process_job(
 
         # Start progress updater
         updater_task = asyncio.create_task(
-            _progress_updater(progress_msg, job_id, progress)
+            _progress_updater(
+                progress_msg, job_id, progress,
+                output_modes=output_modes,
+            )
         )
 
         # Decide where the archive comes from. Three source kinds:
@@ -1240,19 +1249,15 @@ async def _process_job(
             )
 
         # ── Loot add-on: if LOOT_MODE was selected in the mix picker,
-        # run the loot extractor on the same archive and send its
-        # results alongside the normal cookie/credential output.
-        # Important: when the user *also* picked ULP / combo / CC
-        # modes those credentials are already covered by the main
-        # extractor — so the loot pipeline only scans the
-        # Discord / Steam buckets. Otherwise the user would
-        # get duplicated (and possibly differently formatted) password
-        # dumps inside loot_results.zip.
+        # run the Discord + Steam scanner on the same archive and ship
+        # its zip alongside the normal cookie/credential output.
+        # The loot pipeline never re-emits ULP / combo dumps — those
+        # are exclusively handled by the main extractor — so this only
+        # runs the Discord + Steam buckets.
         if LOOT_MODE in output_modes and archive_path and os.path.exists(archive_path):
             try:
                 from services.loot_extractor import (
                     LOOT_DISCORD,
-                    LOOT_PASSWORDS,
                     LOOT_STEAM,
                 )
 
@@ -1260,19 +1265,12 @@ async def _process_job(
                     {LOOT_DISCORD, LOOT_STEAM},
                 )
                 # Honour an explicit override from /loot (if a user
-                # somehow lands here with one) but default to the
-                # no-passwords set above for the mix flow.
+                # somehow lands here with one).
                 pre_buckets = context.user_data.get(  # type: ignore[union-attr]
                     "loot_buckets"
                 ) if hasattr(context, "user_data") else None
                 if pre_buckets:
                     loot_buckets = frozenset(pre_buckets)
-                else:
-                    # If user explicitly asked for ULP/combo password
-                    # dumps from the main extractor, drop them from the
-                    # loot zip to avoid duplicates.
-                    if output_modes & ALL_CREDENTIAL_MODES:
-                        loot_buckets = loot_buckets - {LOOT_PASSWORDS}
 
                 loot_settings = LootExtractionConfig(
                     target_domains=list(domains) if domains else [],
@@ -1302,8 +1300,19 @@ async def _process_job(
         # may be corrupt.
         rescan_armed = False
         rescan_minutes = max(1, config.RESCAN_WINDOW_SECONDS // 60)
+        # Only arm the rescan button when at least one selected mode
+        # actually consumes the domain list. For ULP / Combo (full) /
+        # CC / Loot there's nothing to "search again" — the user
+        # complaint was that the button shows up after ULP runs and
+        # leads to a dead end.
+        rescan_useful = bool(output_modes & _DOMAIN_DEPENDENT_MODES)
         try:
-            if result.success and not result.partial and archive_path:
+            if (
+                rescan_useful
+                and result.success
+                and not result.partial
+                and archive_path
+            ):
                 if is_rescan:
                     # Already in the rescan dir — just refresh the timer.
                     if os.path.exists(archive_path):
@@ -1930,10 +1939,9 @@ def _format_loot_dashboard(progress: ExtractionProgress) -> str:
     bucket_emoji = {
         "discord": "\U0001f3ae",
         "steam": "\U0001f3ae",
-        "passwords": "\U0001f511",
     }
     lines: List[str] = ["\U0001f4e6 Loot scanners"]
-    for name in ("discord", "steam", "passwords"):
+    for name in ("discord", "steam"):
         if name not in counts and name != active:
             continue
         emoji = bucket_emoji.get(name, "\u2022")
@@ -1959,8 +1967,19 @@ def _format_loot_dashboard(progress: ExtractionProgress) -> str:
     return "\n".join(lines)
 
 
-async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> None:
-    """Edit the progress message every few seconds with a live dashboard."""
+async def _progress_updater(
+    msg, job_id: int, progress: ExtractionProgress,
+    output_modes: "frozenset[str] | None" = None,
+) -> None:
+    """Edit the progress message every few seconds with a live dashboard.
+
+    *output_modes* is the set of modes the user picked for this job;
+    the dashboard only shows the stat lines that correspond to picked
+    modes (e.g. picking ULP only no longer shows a "Cookies found" line).
+    """
+    modes = output_modes or frozenset()
+    show_cookies = (not modes) or (COOKIE_MODE in modes)
+    show_creds = (not modes) or bool(modes & ALL_CREDENTIAL_MODES)
     start = time.monotonic()
     last_text = ""
     while True:
@@ -2042,6 +2061,17 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     if progress.files_total else 0
                 )
                 loot_dash = _format_loot_dashboard(progress)
+                stat_lines = ""
+                if show_cookies:
+                    stat_lines += (
+                        f"\U0001f36a Cookies found so far: "
+                        f"{progress.cookies_found:,}\n"
+                    )
+                if show_creds:
+                    stat_lines += (
+                        f"\U0001f4dd Credentials so far: "
+                        f"{progress.credentials_found:,}\n"
+                    )
                 text = (
                     f"\u2699\ufe0f Live Dashboard\n"
                     f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -2051,10 +2081,7 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     f"   {progress_bar(progress.files_scanned, progress.files_total)} "
                     f"{pct:.0f}% ({progress.files_scanned:,}/{progress.files_total:,})\n"
                     f"   Now: {cur_file}\n"
-                    f"\U0001f36a Cookies found so far: "
-                    f"{progress.cookies_found:,}\n"
-                    f"\U0001f4dd Credentials so far: "
-                    f"{progress.credentials_found:,}\n"
+                    f"{stat_lines}"
                     f"\u26a1 Rate: {rate:.1f} files/s   ETA: {seconds_human(eta)}\n"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
@@ -2080,6 +2107,17 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     text += "\n" + loot_dash
             elif progress.phase == "packaging":
                 loot_dash = _format_loot_dashboard(progress)
+                stat_lines = ""
+                if show_cookies:
+                    stat_lines += (
+                        f"\U0001f36a Cookies found: "
+                        f"{progress.cookies_found:,}\n"
+                    )
+                if show_creds:
+                    stat_lines += (
+                        f"\U0001f4dd Credentials found: "
+                        f"{progress.credentials_found:,}\n"
+                    )
                 text = (
                     f"\u2699\ufe0f Live Dashboard\n"
                     f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -2087,9 +2125,7 @@ async def _progress_updater(msg, job_id: int, progress: ExtractionProgress) -> N
                     f"\U0001f4c2 Extract:   Done \u2705\n"
                     f"\U0001f50d Scan:      Done \u2705\n"
                     f"\U0001f4e6 Packaging results into .zip\u2026\n"
-                    f"\U0001f36a Cookies found: {progress.cookies_found:,}\n"
-                    f"\U0001f4dd Credentials found: "
-                    f"{progress.credentials_found:,}\n"
+                    f"{stat_lines}"
                     f"\u23f1 Elapsed: {seconds_human(elapsed)}"
                 )
                 if loot_dash:

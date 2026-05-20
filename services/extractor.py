@@ -305,9 +305,9 @@ class ExtractionProgress:
     current_password_attempt: str = ""
     password_attempts: List[str] = field(default_factory=list)
     # Loot-specific dashboard fields. ``loot_bucket`` is the
-    # currently-running scanner (``discord`` / ``steam`` / ``passwords`` /
-    # ``validate``). ``loot_counts`` is updated as each
-    # bucket finishes with the number of raw hits before validation.
+    # currently-running scanner (``discord`` / ``steam`` /
+    # ``validate``). ``loot_counts`` is updated as each bucket
+    # finishes with the number of raw hits before validation.
     # ``loot_valid_counts`` carries the post-validation live counts.
     loot_bucket: str = ""
     loot_counts: Dict[str, int] = field(default_factory=dict)
@@ -491,16 +491,35 @@ def _safe_tar_extract(
 
 
 
+_HEADER_ENC_HINTS = re.compile(
+    r"(encrypted\s+headers?|header\s+encrypt|"
+    r"password\s+is\s+incorrect|wrong\s+password|"
+    r"the\s+specified\s+password\s+is\s+incorrect|"
+    r"cannot\s+open\s+encrypted\s+archive|"
+    r"file\s+is\s+encrypted|file is encrypted|"
+    r"enter\s+password\s+for|requires\s+a\s+password)",
+    re.IGNORECASE,
+)
+
+
 def _probe_encrypted_entries(archive_path: str) -> List[str]:
     """Return a list of password-protected entry names inside *archive_path*.
 
-    Returns an empty list if the archive has no encrypted entries, or if
-    we can't tell (missing tools, unknown format). Never raises.
+    Returns a non-empty list if the archive needs a password, an empty
+    list if we're confident it doesn't. Never raises.
+
+    For *header-encrypted* archives (where even the file listing is
+    locked behind a password) we can't enumerate entry names, so we
+    return ``["<encrypted header>"]`` as a sentinel — the prompt code
+    only cares whether the list is empty.
 
     Detection order:
-      * For ``.rar``: prefer ``unrar lt -p-`` and look for ``Flags: enc``.
-      * Fallback / other formats: ``7z l -slt`` and look for
-        ``Encrypted = +``.
+      * ``.rar``: prefer ``unrar lt -p-`` and look for ``Flags: enc``;
+        if unrar refuses to list at all and stderr mentions a password
+        we treat that as header encryption.
+      * Fallback / other formats: ``7z l -slt`` looking for
+        ``Encrypted = +`` per entry, or any password-hint in stderr.
+      * zipfile fallback: per-entry ``ZIP_FILECOUNT_LIMIT`` flag (bit 0).
     """
     import shutil as _shutil
 
@@ -518,11 +537,6 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                # ``lt`` (technical listing) emits blocks like:
-                #     Name: foo.txt
-                #     ...
-                #     Flags: encrypted
-                # We parse blocks split on "Name:" lines.
                 blocks = re.split(r"(?m)^Name:\s+", proc.stdout)
                 for blk in blocks[1:]:
                     first_nl = blk.find("\n")
@@ -531,6 +545,10 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
                         encrypted.append(name)
                 if encrypted:
                     return encrypted
+                # Header-encrypted RAR: listing failed entirely.
+                combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                if proc.returncode != 0 and _HEADER_ENC_HINTS.search(combined):
+                    return ["<encrypted header>"]
             except Exception as exc:
                 logger.debug("unrar probe failed ({}); falling back", exc)
 
@@ -550,8 +568,25 @@ def _probe_encrypted_entries(archive_path: str) -> List[str]:
                     cur_name = line[len("Path = "):].strip()
                 elif line.startswith("Encrypted = +") and cur_name:
                     encrypted.append(cur_name)
+            if encrypted:
+                return encrypted
+            combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if proc.returncode != 0 and _HEADER_ENC_HINTS.search(combined):
+                return ["<encrypted header>"]
         except Exception as exc:
             logger.debug("7z probe failed ({})", exc)
+
+    # zipfile fallback — handles entry-level encrypted .zip cleanly even
+    # when 7z isn't installed (and gracefully ignores anything that
+    # isn't actually a zip).
+    if not encrypted and lower.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(archive_path) as zf:
+                for info in zf.infolist():
+                    if info.flag_bits & 0x1:
+                        encrypted.append(info.filename)
+        except Exception as exc:
+            logger.debug("zipfile probe failed ({})", exc)
 
     return encrypted
 

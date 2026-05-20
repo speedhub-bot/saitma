@@ -1,9 +1,14 @@
 """Unit tests for the loot scanner (``services.loot``).
 
-These tests don't touch the network — only the offline scanners and
-output builders. Run with::
+These tests don't touch the network — only the offline scanners.
+Run with::
 
     python -m unittest tests/test_loot.py
+
+Scope: Discord + Steam. (tdata extraction was removed because it
+produced too much trash on real-world stealer dumps, and the ULP /
+combo password dumping moved out of ``/loot`` because ``/extract``
+already covers it.)
 """
 
 from __future__ import annotations
@@ -137,51 +142,51 @@ class SteamScannerTests(unittest.TestCase):
         self.assertEqual(acc.mafile_shared_secret, "AAAA1234==")
 
 
-class CredentialScannerTests(unittest.TestCase):
+class BucketFilteringTests(unittest.TestCase):
+    """``scan_directory_for_loot`` only runs the requested buckets."""
+
     def setUp(self) -> None:
-        self.root = tempfile.mkdtemp(prefix="loot_pwd_")
+        self.root = tempfile.mkdtemp(prefix="loot_buckets_")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        path = os.path.join(self.root, "Chrome", "Passwords.txt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+
+        # Drop a Discord token + a Steam account into the tree so both
+        # scanners *would* find something if they run.
+        disc_dir = os.path.join(self.root, "Discord")
+        os.makedirs(disc_dir, exist_ok=True)
+        with open(os.path.join(disc_dir, "tokens.txt"), "w") as fh:
             fh.write(
-                "=== Chrome ===\n"
-                "URL: https://claude.ai/login\n"
-                "Username: alice@example.com\n"
-                "Password: claude_pass_123\n"
-                "\n"
-                "URL: https://spotify.com/account\n"
-                "Login: alice_sp\n"
-                "Password: spotify_pass\n"
-                "\n"
-                "URL: https://claude.ai/api\n"
-                "User: bob\n"
-                "Password: bob_claude_pw\n"
+                "MTIzNDU2Nzg5MDEyMzQ1Njc4.AbCdEf."
+                "gHiJkL_mNoPqRsTuVwXyZ012345678\n"
+            )
+        steam_dir = os.path.join(self.root, "Steam", "config")
+        os.makedirs(steam_dir, exist_ok=True)
+        with open(os.path.join(steam_dir, "loginusers.vdf"), "w") as fh:
+            fh.write(
+                '"users"\n{\n'
+                '\t"76561198000000001"\n\t{\n'
+                '\t\t"AccountName"\t"alice"\n'
+                '\t}\n}\n'
             )
 
-    def test_parses_blocks_with_synonyms(self) -> None:
+    def test_discord_only_skips_steam(self) -> None:
+        result = loot.scan_directory_for_loot(
+            self.root, buckets=frozenset({"loot_discord"}),
+        )
+        self.assertEqual(len(result.discord), 1)
+        self.assertEqual(result.steam, [])
+
+    def test_steam_only_skips_discord(self) -> None:
+        result = loot.scan_directory_for_loot(
+            self.root, buckets=frozenset({"loot_steam"}),
+        )
+        self.assertEqual(result.discord, [])
+        self.assertEqual(len(result.steam), 1)
+
+    def test_empty_buckets_runs_all(self) -> None:
         result = loot.scan_directory_for_loot(self.root)
-        self.assertEqual(len(result.credentials), 3)
-        domains = sorted({c.domain for c in result.credentials})
-        self.assertEqual(domains, ["claude.ai", "spotify.com"])
-
-    def test_ulp_and_combo_output(self) -> None:
-        result = loot.scan_directory_for_loot(self.root)
-        ulp = loot.build_ulp_text(result.credentials)
-        self.assertIn("https://claude.ai/login:alice@example.com:claude_pass_123",
-                      ulp)
-        combo_all = loot.build_combo_text(result.credentials)
-        self.assertIn("alice@example.com:claude_pass_123", combo_all)
-        structured = loot.build_structured_combo_text(result.credentials)
-        self.assertIn("=== claude.ai ===", structured)
-        self.assertIn("=== spotify.com ===", structured)
-
-    def test_targeted_filter(self) -> None:
-        result = loot.scan_directory_for_loot(self.root)
-        targeted = loot.filter_credentials(result.credentials, ["claude.ai"])
-        self.assertEqual(len(targeted), 2)
-        self.assertTrue(all(c.domain == "claude.ai" for c in targeted))
+        self.assertEqual(len(result.discord), 1)
+        self.assertEqual(len(result.steam), 1)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()
