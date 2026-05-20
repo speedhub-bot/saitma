@@ -92,8 +92,28 @@ python bot.py
 |---------|-------------|
 | `/start` | Show main menu |
 | `/extract` | Start cookie extraction |
+| `/loot` | Recover tdata + Discord + Steam + ULP/combos from a log archive |
+| `/dt` | Discord token validity check (paste tokens or upload a `.txt`) |
 | `/mystats` | View your statistics |
 | `/help` | Usage guide (paginated) |
+
+#### `/dt` — Discord token validity check
+
+`/dt` is the lightweight "is this token alive?" path. It does **not**
+require an archive — paste tokens directly or upload a small `.txt`:
+
+```
+/dt <token>                 # validate one token inline
+/dt <tok1> <tok2> ...       # validate several at once
+/dt                         # prompt for a paste / file
+```
+
+After `/dt` with no args, reply with tokens one per line, or upload a
+`.txt` file containing tokens. Up to **50 tokens** per request; each
+token is checked against Discord's `/users/@me`. Live tokens come back
+with username, user-id, email/phone (when set), MFA flag and Nitro
+tier. Dead tokens are reported with the HTTP reason; transient
+network / rate-limit failures are tagged `UNKNOWN` so you can re-run.
 
 ### Admin Commands
 | Command | Description |
