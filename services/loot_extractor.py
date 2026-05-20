@@ -9,20 +9,19 @@ to the user.
 The on-disk layout of ``loot_results.zip`` is::
 
     loot_summary.txt
-    tdata/
-      <account_label>/
-        tdata.zip
-        info.txt
     discord_tokens.txt
     steam_accounts.txt
-    credentials/
-      ulp.txt
-      combo_all.txt
-      combo_structured.txt
-      combo_<target>.txt           # one per requested domain
 
 Empty sections are skipped so the user never receives a zip full of
 zero-byte placeholder files.
+
+What used to live here that no longer does:
+
+* tdata extraction — produced too many false positives on real-world
+  stealer dumps; the user explicitly asked for it to go.
+* Saved-password (ULP / combo) dumping — ``/extract`` already does that
+  through the ``/ulp`` and ``/combo`` modes. Having it inside ``/loot``
+  too just made the result zip duplicate output.
 """
 
 from __future__ import annotations
@@ -58,81 +57,16 @@ _LOOT_BUNDLE_LIMIT = getattr(
 # Loot scan bucket identifiers — used by handlers to request a subset
 # of the available scanners.
 LOOT_ALL = "loot_all"
-LOOT_TDATA = "loot_tdata"
 LOOT_DISCORD = "loot_discord"
 LOOT_STEAM = "loot_steam"
-LOOT_PASSWORDS = "loot_passwords"
 
-ALL_LOOT_BUCKETS = frozenset(
-    {LOOT_TDATA, LOOT_DISCORD, LOOT_STEAM, LOOT_PASSWORDS},
-)
+ALL_LOOT_BUCKETS = frozenset({LOOT_DISCORD, LOOT_STEAM})
 
 
 def _safe_label(value: str) -> str:
     """Sanitise *value* into something usable as a filename component."""
     cleaned = re.sub(r"[^A-Za-z0-9._+-]", "_", value.strip())
     return cleaned or "unknown"
-
-
-def _account_label(acc: loot_mod.TdataAccount, idx: int) -> str:
-    """Build a stable per-account folder name (``phone_userid`` when both
-    are known, otherwise falls back to the keyfile prefix)."""
-    phone = acc.info.get("phone", "")
-    user_id = acc.info.get("user_id", "")
-    if phone and user_id:
-        return _safe_label(f"{phone}_{user_id}")
-    if user_id:
-        return _safe_label(f"user_{user_id}")
-    if phone:
-        return _safe_label(phone)
-    if acc.keyfile:
-        return _safe_label(f"tdata_{acc.keyfile}")
-    return f"tdata_{idx + 1}"
-
-
-def _zip_tdata_folder(src: str, dest_zip: str) -> None:
-    """Recursively zip *src* (the ``tdata`` directory) into *dest_zip*.
-
-    We always re-root the archive at ``tdata/`` so the result can be
-    dropped straight into ``%APPDATA%/Telegram Desktop/`` on the
-    operator's side.
-    """
-    src = os.path.abspath(src)
-    base = os.path.basename(src.rstrip(os.sep))
-    if base.lower() != "tdata":
-        base = "tdata"
-    with zipfile.ZipFile(
-        dest_zip, "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=6,
-    ) as zf:
-        for dirpath, _dirs, files in os.walk(src):
-            for name in files:
-                full = os.path.join(dirpath, name)
-                rel = os.path.relpath(full, src)
-                zf.write(full, arcname=os.path.join(base, rel))
-
-
-def _render_tdata_info(acc: loot_mod.TdataAccount) -> str:
-    """Human-readable per-account ``info.txt`` shipped next to the
-    zipped tdata folder."""
-    lines: List[str] = ["=== TDATA ACCOUNT ==="]
-    lines.append(f"keyfile        : {acc.keyfile or '?'}")
-    lines.append(f"key_datas size : {acc.key_datas_size} bytes")
-    lines.append(f"TDF$ magic     : {'yes' if acc.has_tdf_magic else 'no'}")
-    lines.append(f"maps present   : {'yes' if acc.has_maps else 'no'}")
-    lines.append(f"structurally valid : {'yes' if acc.valid else 'no'}")
-    if acc.reason:
-        lines.append(f"reason         : {acc.reason}")
-    if acc.info_path:
-        lines.append(f"info source    : {os.path.basename(acc.info_path)}")
-    if acc.info:
-        lines.append("")
-        lines.append("=== ACCOUNT METADATA ===")
-        for key, val in acc.info.items():
-            label = key.replace("_", " ").title()
-            lines.append(f"{label:18s}: {val}")
-    return "\n".join(lines) + "\n"
 
 
 def _render_discord_lines(tokens: Iterable[loot_mod.DiscordToken]) -> str:
@@ -203,18 +137,14 @@ def _render_summary(
     validated: bool,
     buckets: "frozenset[str] | None" = None,
 ) -> str:
-    valid_tdata = sum(1 for a in result.tdata if a.valid)
     live_discord = sum(1 for t in result.discord if t.valid is True)
     dead_discord = sum(1 for t in result.discord if t.valid is False)
     unknown_discord = sum(1 for t in result.discord if t.valid is None)
     live_steam = sum(1 for a in result.steam if a.valid is True)
-    domains = sorted({c.domain for c in result.credentials if c.domain})
 
     run_all = not buckets
-    show_tdata = run_all or (buckets and LOOT_TDATA in buckets)
     show_discord = run_all or (buckets and LOOT_DISCORD in buckets)
     show_steam = run_all or (buckets and LOOT_STEAM in buckets)
-    show_passwords = run_all or (buckets and LOOT_PASSWORDS in buckets)
 
     lines = [
         "=== LOOT SUMMARY ===",
@@ -223,11 +153,6 @@ def _render_summary(
         f"Validation         : {'on' if validated else 'off'}",
         "",
     ]
-    if show_tdata:
-        lines.append(
-            f"tdata accounts     : {len(result.tdata)} "
-            f"({valid_tdata} structurally valid)"
-        )
     if show_discord:
         if validated:
             lines.append(
@@ -245,9 +170,6 @@ def _render_summary(
             )
         else:
             lines.append(f"Steam accounts     : {len(result.steam)}")
-    if show_passwords:
-        lines.append(f"Credentials        : {len(result.credentials)}")
-        lines.append(f"Unique domains     : {len(domains)}")
     if result.errors:
         lines.append("")
         lines.append("=== ERRORS ===")
@@ -309,17 +231,10 @@ def _stage_outputs(
 ) -> None:
     """Materialise the loot result into ``loot_out_dir``.
 
-    Only structurally-valid tdata accounts get re-zipped — invalid /
-    half-corrupt sessions go into ``tdata/REJECTED.txt`` so the user
-    isn't shipped a zip full of broken sessions. Set
-    ``LOOT_KEEP_INVALID_TDATA=1`` in the environment to include them
-    anyway.
+    Empty buckets produce no files — the user never receives a zip
+    full of zero-byte placeholders.
     """
-    keep_invalid = bool(
-        getattr(config, "LOOT_KEEP_INVALID_TDATA", False),
-    )
-
-    # ── summary ──────────────────────────────────────────────────
+    # summary
     summary = _render_summary(
         result,
         archive_name=archive_name,
@@ -329,35 +244,7 @@ def _stage_outputs(
     )
     _write_text(os.path.join(loot_out_dir, "loot_summary.txt"), summary)
 
-    # ── tdata accounts (one folder per account) ─────────────────
-    used_labels: dict[str, int] = {}
-    rejected: List[str] = []
-    for idx, acc in enumerate(result.tdata):
-        if not acc.valid and not keep_invalid:
-            rejected.append(
-                f"{_account_label(acc, idx)}: {acc.reason or 'invalid'}"
-            )
-            continue
-        label = _account_label(acc, idx)
-        used_labels[label] = used_labels.get(label, 0) + 1
-        if used_labels[label] > 1:
-            label = f"{label}_{used_labels[label]}"
-        acc_dir = os.path.join(loot_out_dir, "tdata", label)
-        os.makedirs(acc_dir, exist_ok=True)
-        _write_text(os.path.join(acc_dir, "info.txt"), _render_tdata_info(acc))
-        try:
-            _zip_tdata_folder(acc.root, os.path.join(acc_dir, "tdata.zip"))
-        except Exception:
-            logger.exception("Failed to zip tdata folder at {}", acc.root)
-    if rejected:
-        _write_text(
-            os.path.join(loot_out_dir, "tdata", "REJECTED.txt"),
-            "Sessions that failed structural validation and were not "
-            "bundled (re-run with LOOT_KEEP_INVALID_TDATA=1 to keep "
-            "them):\n\n" + "\n".join(rejected) + "\n",
-        )
-
-    # ── tokens ───────────────────────────────────────────────────
+    # tokens
     if result.discord:
         discord_text = _render_discord_lines(result.discord)
         _write_text(
@@ -369,35 +256,6 @@ def _stage_outputs(
         _write_text(
             os.path.join(loot_out_dir, "steam_accounts.txt"), steam_text,
         )
-
-    # ── credentials ──────────────────────────────────────────────
-    if result.credentials:
-        cred_dir = os.path.join(loot_out_dir, "credentials")
-        os.makedirs(cred_dir, exist_ok=True)
-        _write_text(
-            os.path.join(cred_dir, "ulp.txt"),
-            loot_mod.build_ulp_text(result.credentials),
-        )
-        _write_text(
-            os.path.join(cred_dir, "combo_all.txt"),
-            loot_mod.build_combo_text(result.credentials),
-        )
-        _write_text(
-            os.path.join(cred_dir, "combo_structured.txt"),
-            loot_mod.build_structured_combo_text(result.credentials),
-        )
-        for domain in settings.target_domains:
-            targeted = loot_mod.filter_credentials(
-                result.credentials, [domain],
-            )
-            text = loot_mod.build_combo_text(targeted)
-            if text:
-                _write_text(
-                    os.path.join(
-                        cred_dir, f"combo_{_safe_label(domain)}.txt",
-                    ),
-                    text,
-                )
 
 
 def _run_loot_extraction(

