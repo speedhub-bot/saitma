@@ -24,6 +24,7 @@ from telegram.ext import Application
 import config
 from db import database as db
 from handlers import admin as admin_handlers
+from handlers import discord_check as discord_check_handlers
 from handlers import extract as extract_handlers
 from handlers import loot as loot_handlers
 from handlers import user as user_handlers
@@ -219,6 +220,7 @@ def main() -> None:
     user_handlers.register(app)
     extract_handlers.register(app, job_queue)
     loot_handlers.register(app, job_queue)
+    discord_check_handlers.register(app)
     admin_handlers.register(app, job_queue)
 
     # Global error handler
@@ -244,6 +246,10 @@ def main() -> None:
                 BotCommand(
                     "loot",
                     "Loot — Discord tokens + Steam accounts",
+                ),
+                BotCommand(
+                    "dt",
+                    "Discord token validity check (paste / .txt)",
                 ),
                 BotCommand("mystats", "Show your usage stats"),
                 BotCommand("help", "How to use the bot"),
